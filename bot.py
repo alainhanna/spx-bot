@@ -480,7 +480,11 @@ def send_email(subject, body):
         msg["From"]    = GMAIL_USER
         msg["To"]      = ALERT_EMAIL
         msg.attach(MIMEText(body, "plain"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        # Use port 587 with STARTTLS (Railway allows this, blocks 465)
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
             s.login(GMAIL_USER, GMAIL_PASSWORD)
             s.sendmail(GMAIL_USER, ALERT_EMAIL, msg.as_string())
         print(f"[EMAIL SENT] {subject}")
