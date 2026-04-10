@@ -542,13 +542,8 @@ def evaluate_signal(bars, vix=None, gex_zero=None, intraday_trend="NEUTRAL"):
     if spot > ema9: bull_pts += 5
     else:           bear_pts += 5
 
-    # GEX filter — if price is within 5pts of GEX zero, add confluence
-    if gex_zero:
-        distance_to_gex = abs(spot - gex_zero)
-        if distance_to_gex < 5:
-            # Near GEX zero = mean revert zone, boost whichever side is indicated
-            if spot > gex_zero: bull_pts += 8
-            else:               bear_pts += 8
+    # GEX stripped — Options Basic plan doesn't include snapshot OI data
+    # Signal runs on RSI + VWAP + EMA + Momentum + Trend
 
     total = bull_pts + bear_pts
     if total == 0:
@@ -578,18 +573,17 @@ def evaluate_signal(bars, vix=None, gex_zero=None, intraday_trend="NEUTRAL"):
     strike_offset = spot * 0.002
     if bias == "BULL":
         strike     = round((spot + strike_offset) / 5) * 5
-        # Invalidate anchored to GEX zero if available, else VWAP
-        invalidate = round(gex_zero - 5, 2) if gex_zero and gex_zero < spot else round(vwap - candle_range * 0.5, 2)
+        invalidate = round(vwap - candle_range * 0.5, 2)
     else:
         strike     = round((spot - strike_offset) / 5) * 5
-        invalidate = round(gex_zero + 5, 2) if gex_zero and gex_zero > spot else round(vwap + candle_range * 0.5, 2)
+        invalidate = round(vwap + candle_range * 0.5, 2)
 
     return {
         "bias": bias, "option_type": option_type,
         "confidence": min(confidence, 95), "spot": round(spot, 2),
         "strike": strike, "vwap": vwap, "rsi": rsi,
         "ema9": ema9, "ema21": ema21, "invalidate": invalidate,
-        "gex_zero": gex_zero, "intraday_trend": intraday_trend,
+        "gex_zero": None, "intraday_trend": intraday_trend,
         "vix": vix, "high_vix": vix > VIX_HIGH_THRESHOLD if vix else False,
     }
 
@@ -793,36 +787,13 @@ def main():
             if len(vix_history) > 20:
                 vix_history.pop(0)
 
-        # Refresh GEX every 30 minutes during market hours
-        if is_market_open():
-            should_refresh_gex = (
-                last_gex_fetch is None or
-                (now_et - last_gex_fetch).total_seconds() / 60 >= GEX_REFRESH_MINS
-            )
-            if should_refresh_gex:
-                print(f"[{now_et.strftime('%H:%M ET')}] Refreshing GEX data...")
-                bars_for_spot = get_spx_bars(limit=5)
-                spot_for_gex  = bars_for_spot[-1]["c"] if bars_for_spot else 5800
-                chain         = get_spx_options_chain()
-                if chain:
-                    gex_zero, top_gex_levels, total_gex = calculate_gex(chain, spot_for_gex)
-                    print(f"[{now_et.strftime('%H:%M ET')}] GEX Zero: {gex_zero} | Top levels: {top_gex_levels}")
-                last_gex_fetch = now_et
-
         # Pre-market brief at 6 AM ET
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
             print(f"[{now_et.strftime('%H:%M ET')}] Fetching economic calendar...")
             today_events = get_economic_events()
             print(f"[{now_et.strftime('%H:%M ET')}] Found {len(today_events)} high-impact events today.")
             print(f"[{now_et.strftime('%H:%M ET')}] Sending pre-market brief...")
-            bars_pm = get_spx_bars(limit=5)
-            spot_pm = bars_pm[-1]["c"] if bars_pm else 5800
-            chain_pm = get_spx_options_chain()
-            if chain_pm:
-                gex_zero_pm, top_levels_pm, _ = calculate_gex(chain_pm, spot_pm)
-            else:
-                gex_zero_pm, top_levels_pm = None, []
-            send_premarket_brief(vix=vix, gex_zero=gex_zero_pm, top_gex_levels=top_levels_pm, today_events=today_events)
+            send_premarket_brief(vix=vix, gex_zero=None, top_gex_levels=[], today_events=today_events)
             premarket_sent = True
 
         # RTH signal loop
