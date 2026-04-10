@@ -22,8 +22,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6459251326")
 # Signal parameters
 PROFIT_TARGET_PCT    = 45
 STOP_LOSS_PCT        = 50
-MIN_CONFIDENCE       = 65
-MIN_CONFIDENCE_HIGH_VIX = 75   # tightens automatically when VIX > 25
+MIN_CONFIDENCE       = 60
+MIN_CONFIDENCE_HIGH_VIX = 70   # tightens automatically when VIX > 25
 VIX_HIGH_THRESHOLD   = 25
 POLL_INTERVAL_SEC    = 15
 COOLDOWN_MINUTES     = 1
@@ -587,14 +587,6 @@ def evaluate_signal(bars, vix=None, gex_zero=None, intraday_trend="NEUTRAL"):
         bias        = "BEAR"
         option_type = "PUT"
         confidence  = round(50 + (bear_pts - bull_pts) / total * 50)
-
-    # TREND FILTER — block counter-trend signals
-    if intraday_trend == "BULL" and bias == "BEAR":
-        print(f"  [TREND FILTER] Strong BULL trend — blocking PUT signal")
-        return None
-    if intraday_trend == "BEAR" and bias == "BULL":
-        print(f"  [TREND FILTER] Strong BEAR trend — blocking CALL signal")
-        return None
 
     if confidence < effective_min_confidence:
         return None
