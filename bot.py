@@ -10,10 +10,12 @@ from email.mime.multipart import MIMEMultipart
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "1u0RUGbackck5ayq2Ab05ErcVPDEs5pl")
-ALERT_EMAIL     = os.environ.get("ALERT_EMAIL", "alain.hanna55@gmail.com")
-GMAIL_USER      = os.environ.get("GMAIL_USER")
-GMAIL_PASSWORD  = os.environ.get("GMAIL_PASSWORD")
+POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "1u0RUGbackck5ayq2Ab05ErcVPDEs5pl")
+ALERT_EMAIL      = os.environ.get("ALERT_EMAIL", "alain.hanna55@gmail.com")
+GMAIL_USER       = os.environ.get("GMAIL_USER")
+GMAIL_PASSWORD   = os.environ.get("GMAIL_PASSWORD")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8796616207:AAEUsEl45pRz92mYXVSUIEFUW1t-CNepGdY")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6459251326")
 
 # Signal parameters
 PROFIT_TARGET_PCT    = 45
@@ -470,26 +472,46 @@ def evaluate_signal(bars, vix=None, gex_zero=None, intraday_trend="NEUTRAL"):
 # ─────────────────────────────────────────
 # EMAIL
 # ─────────────────────────────────────────
-def send_email(subject, body):
-    if not GMAIL_USER or not GMAIL_PASSWORD:
-        print(f"\n{'='*50}\n[NO EMAIL CONFIG]\n{subject}\n{body}\n{'='*50}")
-        return
+def send_alert(subject, body):
+    """Send alert via Telegram (primary) and email (fallback)"""
+    message = f"*{subject}*\n\n```{body}```"
+    # Try Telegram first
     try:
-        msg = MIMEMultipart()
-        msg["Subject"] = subject
-        msg["From"]    = GMAIL_USER
-        msg["To"]      = ALERT_EMAIL
-        msg.attach(MIMEText(body, "plain"))
-        # Use port 587 with STARTTLS (Railway allows this, blocks 465)
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
-            s.ehlo()
-            s.starttls()
-            s.ehlo()
-            s.login(GMAIL_USER, GMAIL_PASSWORD)
-            s.sendmail(GMAIL_USER, ALERT_EMAIL, msg.as_string())
-        print(f"[EMAIL SENT] {subject}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": f"{subject}\n\n{body}",
+            "parse_mode": "Markdown"
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            print(f"[TELEGRAM SENT] {subject}")
+            return
+        else:
+            print(f"[TELEGRAM ERROR] {r.status_code}: {r.text}")
     except Exception as e:
-        print(f"[ERROR] email: {e}")
+        print(f"[TELEGRAM ERROR] {e}")
+
+    # Fallback to email
+    send_email(subject, body)
+
+def send_email(subject, body):
+    """Send alert via Telegram — works on Railway (HTTPS not SMTP)"""
+    TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8796616207:AAEUsEl45pRz92mYXVSUIEFUW1t-CNepGdY")
+    TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6459251326")
+    message = f"{subject}\n\n{body}"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        }, timeout=10)
+        if r.status_code == 200:
+            print(f"[TELEGRAM SENT] {subject}")
+        else:
+            print(f"[ERROR] telegram: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[ERROR] telegram: {e}")
 
 def format_signal(sig):
     t     = datetime.datetime.now(ET).strftime("%I:%M %p ET")
@@ -575,7 +597,7 @@ Confidence:   {conf_today}%+ required today
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Signal alerts fire automatically during RTH.
 """
-        send_email(subj, body)
+        send_alert(subj, body)
     except Exception as e:
         print(f"[ERROR] premarket brief: {e}")
 
@@ -670,7 +692,7 @@ def main():
                     spot_now  = bars_spot[-1]["c"] if bars_spot else None
                     subj, body = format_vix_alert(alert, spot=spot_now)
                     if subj and body:
-                        send_email(subj, body)
+                        send_alert(subj, body)
                         print(f"\n[VIX ALERT] {subj}")
                         print(body)
 
@@ -704,7 +726,7 @@ def main():
                                 print(f"  Same direction as last signal — skipping.")
                             else:
                                 subj, body = format_signal(sig)
-                                send_email(subj, body)
+                                send_alert(subj, body)
                                 print(body)
                                 trade_count     += 1
                                 last_signal_time = now_et
