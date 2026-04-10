@@ -14,7 +14,7 @@ POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "1u0RUGbackck5ayq2Ab05ErcVPD
 ALERT_EMAIL     = os.environ.get("ALERT_EMAIL", "alain.hanna55@gmail.com")
 GMAIL_USER      = os.environ.get("GMAIL_USER")      # your Gmail sending address
 GMAIL_PASSWORD  = os.environ.get("GMAIL_PASSWORD")  # Gmail App Password
-
+ 
 # Signal parameters
 PROFIT_TARGET_PCT = 45
 STOP_LOSS_PCT     = 50
