@@ -25,6 +25,11 @@ POLL_INTERVAL_SEC    = 15
 COOLDOWN_MINUTES     = 1
 MAX_TRADES_PER_DAY   = 25
 
+# VIX Spike parameters
+VIX_SPIKE_LEVELS     = [20, 25, 30]   # alert when VIX crosses these
+VIX_REVERSAL_POINTS  = 1.5            # VIX must drop this much from high to fire CALL signal
+VIX_ALLCLEAR_LEVEL   = 20             # VIX dropping below this fires all-clear
+
 ET = pytz.timezone("America/New_York")
 
 # ─────────────────────────────────────────
@@ -194,8 +199,122 @@ def detect_trend(bars):
         return "NEUTRAL"
 
 # ─────────────────────────────────────────
-# INDICATORS
+# VIX SPIKE MONITOR
 # ─────────────────────────────────────────
+def check_vix_spike(vix, vix_history, last_vix_alerts):
+    """
+    Monitor VIX for spikes and reversals.
+    Returns list of alerts to send, each is a dict with type and message.
+    vix_history: list of recent VIX values (last 20 readings)
+    last_vix_alerts: set of levels already alerted to avoid duplicates
+    """
+    if vix is None or len(vix_history) < 2:
+        return []
+
+    alerts = []
+    prev_vix = vix_history[-2] if len(vix_history) >= 2 else vix
+
+    # Check for level crossings
+    for level in VIX_SPIKE_LEVELS:
+        key_up   = f"cross_up_{level}"
+        key_down = f"cross_down_{level}"
+
+        # VIX crossed UP through level
+        if prev_vix < level <= vix and key_up not in last_vix_alerts:
+            alerts.append({
+                "type": "SPIKE",
+                "level": level,
+                "vix": vix,
+                "direction": "UP"
+            })
+            last_vix_alerts.add(key_up)
+            last_vix_alerts.discard(key_down)  # reset down alert
+
+        # VIX crossed DOWN through level
+        if prev_vix > level >= vix and key_down not in last_vix_alerts:
+            alerts.append({
+                "type": "CROSS_DOWN",
+                "level": level,
+                "vix": vix,
+                "direction": "DOWN"
+            })
+            last_vix_alerts.add(key_down)
+            last_vix_alerts.discard(key_up)
+
+    # Check for reversal — VIX dropped VIX_REVERSAL_POINTS from recent high
+    if len(vix_history) >= 5:
+        recent_high = max(vix_history[-10:]) if len(vix_history) >= 10 else max(vix_history)
+        reversal_key = f"reversal_{round(recent_high)}"
+        if (recent_high >= 20 and
+            recent_high - vix >= VIX_REVERSAL_POINTS and
+            reversal_key not in last_vix_alerts):
+            alerts.append({
+                "type": "REVERSAL",
+                "vix": vix,
+                "vix_high": recent_high,
+                "drop": round(recent_high - vix, 2)
+            })
+            last_vix_alerts.add(reversal_key)
+
+    return alerts
+
+def format_vix_alert(alert, spot=None):
+    t = datetime.datetime.now(ET).strftime("%I:%M %p ET")
+
+    if alert["type"] == "SPIKE":
+        subj = f"⚠️ VIX SPIKE ALERT — {alert['vix']:.1f} crossed {alert['level']}"
+        body = f"""
+VIX SPIKE ALERT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Time:     {t}
+VIX:      {alert['vix']:.2f}  ▲ crossed {alert['level']}
+SPX:      {spot:,.2f}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Volatility expanding. Be cautious on new entries.
+Wait for VIX to reverse before fading the move.
+Normal signals require {MIN_CONFIDENCE_HIGH_VIX}%+ confidence now.
+"""
+
+    elif alert["type"] == "CROSS_DOWN":
+        subj = f"✅ VIX CALMING — {alert['vix']:.1f} dropped below {alert['level']}"
+        body = f"""
+VIX CALMING ALERT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Time:     {t}
+VIX:      {alert['vix']:.2f}  ▼ below {alert['level']}
+SPX:      {spot:,.2f}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Volatility contracting. Normal conditions resuming.
+Signal confidence threshold back to {MIN_CONFIDENCE}%.
+"""
+
+    elif alert["type"] == "REVERSAL":
+        strike = round((spot + spot * 0.002) / 5) * 5 if spot else "N/A"
+        subj = f"🟢 VIX REVERSAL — Mean Reversion CALL Setup"
+        body = f"""
+VIX REVERSAL — CALL SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Time:       {t}
+VIX High:   {alert['vix_high']:.2f}
+VIX Now:    {alert['vix']:.2f}  (dropped {alert['drop']} pts)
+SPX:        {spot:,.2f}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VIX REVERSAL SETUP:
+Strike:     {strike} CALL 0DTE
+Thesis:     Fear peaked, mean reversion rally likely
+Target:     +45% of premium
+Invalidate: VIX makes new high
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Execute manually in Robinhood.
+This is a VIX-driven signal, independent of RSI/VWAP.
+"""
+    else:
+        return None, None
+
+    return subj, body
+
+
+
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -459,6 +578,10 @@ def main():
     last_gex_fetch = None
     GEX_REFRESH_MINS = 30
 
+    # VIX spike tracking
+    vix_history    = []
+    last_vix_alerts = set()
+
     while True:
         now_et = datetime.datetime.now(ET)
         today  = now_et.date()
@@ -473,10 +596,16 @@ def main():
             gex_zero         = None
             top_gex_levels   = []
             last_gex_fetch   = None
+            vix_history      = []
+            last_vix_alerts  = set()
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
-        # Fetch VIX
+        # Fetch VIX and update history
         vix = get_vix()
+        if vix is not None:
+            vix_history.append(vix)
+            if len(vix_history) > 20:
+                vix_history.pop(0)
 
         # Refresh GEX every 30 minutes during market hours
         if is_market_open():
@@ -510,6 +639,19 @@ def main():
 
         # RTH signal loop
         if is_market_open():
+
+            # VIX spike monitor — runs every scan regardless of entry window
+            if len(vix_history) >= 2:
+                vix_alerts = check_vix_spike(vix, vix_history, last_vix_alerts)
+                for alert in vix_alerts:
+                    bars_spot = get_spx_bars(limit=3)
+                    spot_now  = bars_spot[-1]["c"] if bars_spot else None
+                    subj, body = format_vix_alert(alert, spot=spot_now)
+                    if subj and body:
+                        send_email(subj, body)
+                        print(f"\n[VIX ALERT] {subj}")
+                        print(body)
+
             if trade_count >= MAX_TRADES_PER_DAY:
                 print(f"[{now_et.strftime('%H:%M ET')}] Max {MAX_TRADES_PER_DAY} trades hit. Done for today.")
             elif not in_entry_window():
