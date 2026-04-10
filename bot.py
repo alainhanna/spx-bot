@@ -20,7 +20,8 @@ PROFIT_TARGET_PCT = 45
 STOP_LOSS_PCT     = 50
 MIN_CONFIDENCE    = 65
 POLL_INTERVAL_SEC = 120  # every 2 minutes
-COOLDOWN_MINUTES  = 30
+COOLDOWN_MINUTES  = 1
+MAX_TRADES_PER_DAY = 25
 
 ET = pytz.timezone("America/New_York")
 
@@ -300,7 +301,7 @@ def main():
 
         # RTH signal loop
         if is_market_open():
-            if trade_count >= 3:
+            if trade_count >= MAX_TRADES_PER_DAY
                 print(f"[{now_et.strftime('%H:%M ET')}] Max 3 trades hit. Done for today.")
             elif not in_entry_window():
                 print(f"[{now_et.strftime('%H:%M ET')}] Outside entry window.")
