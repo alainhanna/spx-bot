@@ -245,65 +245,71 @@ def get_momentum_bias_post_event(bars):
 
 def calculate_gex(options_chain, spot):
     """
-    Calculate simplified GEX (Gamma Exposure) from options chain.
-    GEX = sum of (gamma * OI * 100 * spot^2 * 0.01) for each strike
-    Positive GEX = dealers are long gamma (price pinned)
-    Negative GEX = dealers are short gamma (price accelerates)
-    Returns: gex_zero (flip level), gex_by_strike dict, total_gex
+    OI-based gravity levels as GEX proxy (gamma not available on free Polygon tier).
+    - call_oi - put_oi per strike = net dealer exposure proxy
+    - GEX zero = strike where net OI flips from positive to negative
+    - Top levels = highest total OI strikes (max pain / pin risk)
+    Returns: gex_zero (flip level), top_strikes list, total_oi
     """
     if not options_chain:
-        return None, {}, 0
+        return None, [], 0
 
-    gex_by_strike = {}
-    total_gex = 0
+    call_oi_by_strike = {}
+    put_oi_by_strike  = {}
+    total_oi = 0
 
     for contract in options_chain:
         try:
-            details   = contract.get("details", {})
-            greeks    = contract.get("greeks", {})
-            strike    = details.get("strike_price", 0)
-            cp        = details.get("contract_type", "").lower()
-            oi        = contract.get("open_interest", 0)
-            gamma     = greeks.get("gamma", 0)
+            details = contract.get("details", {})
+            strike  = details.get("strike_price", 0)
+            cp      = details.get("contract_type", "").lower()
+            oi      = contract.get("open_interest", 0) or 0
 
-            if not all([strike, oi, gamma]):
+            if not strike or not oi:
                 continue
 
-            # Calls add positive GEX, puts subtract
-            sign = 1 if cp == "call" else -1
-            gex  = sign * gamma * oi * 100 * (spot ** 2) * 0.01
-
-            if strike not in gex_by_strike:
-                gex_by_strike[strike] = 0
-            gex_by_strike[strike] += gex
-            total_gex += gex
+            if cp == "call":
+                call_oi_by_strike[strike] = call_oi_by_strike.get(strike, 0) + oi
+            elif cp == "put":
+                put_oi_by_strike[strike]  = put_oi_by_strike.get(strike, 0) + oi
+            total_oi += oi
 
         except Exception:
             continue
 
-    if not gex_by_strike:
-        return None, {}, 0
+    all_strikes = sorted(set(list(call_oi_by_strike.keys()) + list(put_oi_by_strike.keys())))
 
-    # GEX Zero = strike where cumulative GEX flips from positive to negative
-    sorted_strikes = sorted(gex_by_strike.keys())
-    cum_gex = 0
-    gex_zero = spot  # default to spot if we can't find flip
+    if not all_strikes:
+        return None, [], 0
 
-    for strike in sorted_strikes:
-        prev_gex = cum_gex
-        cum_gex += gex_by_strike[strike]
-        if prev_gex > 0 and cum_gex <= 0:
-            gex_zero = strike
+    # Net OI per strike (calls - puts) — flip point = GEX zero proxy
+    net_oi = {}
+    for s in all_strikes:
+        net_oi[s] = call_oi_by_strike.get(s, 0) - put_oi_by_strike.get(s, 0)
+
+    # Find flip point closest to spot
+    gex_zero = spot
+    strikes_near_spot = [s for s in all_strikes if abs(s - spot) <= 200]
+    for i in range(len(strikes_near_spot) - 1):
+        s1, s2 = strikes_near_spot[i], strikes_near_spot[i+1]
+        if net_oi.get(s1, 0) > 0 and net_oi.get(s2, 0) <= 0:
+            gex_zero = s2
             break
-        elif prev_gex < 0 and cum_gex >= 0:
-            gex_zero = strike
+        elif net_oi.get(s1, 0) < 0 and net_oi.get(s2, 0) >= 0:
+            gex_zero = s2
             break
 
-    # Find top 3 GEX levels (highest absolute gamma)
-    top_levels = sorted(gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+    # Top OI levels = highest total OI (call + put) near spot
+    total_oi_by_strike = {}
+    for s in all_strikes:
+        if abs(s - spot) <= 150:
+            total_oi_by_strike[s] = call_oi_by_strike.get(s, 0) + put_oi_by_strike.get(s, 0)
+
+    top_levels  = sorted(total_oi_by_strike.items(), key=lambda x: x[1], reverse=True)[:5]
     top_strikes = sorted([s for s, _ in top_levels])
 
-    return round(gex_zero, 0), top_strikes, round(total_gex, 0)
+    print(f"[GEX] Zero={gex_zero} | Top OI strikes={top_strikes} | Total OI={total_oi:,}")
+    return round(gex_zero, 0), top_strikes, round(total_oi, 0)
 
 # ─────────────────────────────────────────
 # TREND DETECTION
