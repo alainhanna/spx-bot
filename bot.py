@@ -340,9 +340,9 @@ def detect_trend(bars):
     price_position = (current_price - low_of_day) / day_range
     move_pct = (current_price - session_open) / session_open * 100
 
-    if move_pct > 0.4 and price_position > 0.65:
+    if move_pct > 0.15 and price_position > 0.60:
         return "BULL"
-    elif move_pct < -0.4 and price_position < 0.35:
+    elif move_pct < -0.15 and price_position < 0.40:
         return "BEAR"
     else:
         return "NEUTRAL"
