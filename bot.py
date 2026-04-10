@@ -125,6 +125,105 @@ def get_spx_options_chain():
         print(f"[ERROR] options chain: {e}")
     return []
 
+# ─────────────────────────────────────────
+# ECONOMIC CALENDAR
+# ─────────────────────────────────────────
+# High impact events — hardcoded keywords to flag
+HIGH_IMPACT_KEYWORDS = [
+    "consumer price index", "cpi",
+    "federal reserve", "fomc", "fed rate", "interest rate decision",
+    "nonfarm payroll", "nfp", "jobs report",
+    "gdp", "gross domestic product",
+    "pce", "personal consumption",
+    "producer price index", "ppi",
+    "unemployment rate", "jobless claims",
+    "retail sales", "consumer sentiment",
+    "ism manufacturing", "ism services"
+]
+
+def get_economic_events():
+    """
+    Fetch today's economic events from financialmodelingprep (free tier).
+    Returns list of high-impact events with times.
+    """
+    today = datetime.date.today().isoformat()
+    url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={today}&to={today}&apikey=demo"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return []
+        events = r.json()
+        if not isinstance(events, list):
+            return []
+
+        high_impact = []
+        for e in events:
+            name   = (e.get("event") or "").lower()
+            impact = (e.get("impact") or "").lower()
+            date   = e.get("date") or ""
+
+            # Include if marked high impact OR matches our keywords
+            is_high = impact in ("high", "critical")
+            is_keyword = any(k in name for k in HIGH_IMPACT_KEYWORDS)
+
+            if (is_high or is_keyword) and date:
+                try:
+                    # Parse event time
+                    event_dt = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+                    event_et = ET.localize(event_dt)
+                    high_impact.append({
+                        "name": e.get("event", "Unknown"),
+                        "time": event_et,
+                        "impact": impact,
+                        "actual": e.get("actual"),
+                        "estimate": e.get("estimate"),
+                    })
+                except Exception:
+                    continue
+
+        return high_impact
+    except Exception as e:
+        print(f"[ERROR] calendar: {e}")
+    return []
+
+def check_event_blackout(events, window_minutes=30):
+    """
+    Returns (in_blackout, event_name, minutes_away) if within window of a high-impact event.
+    Blackout: 30 min before AND 15 min after each event.
+    """
+    now = datetime.datetime.now(ET)
+    for event in events:
+        event_time = event["time"]
+        mins_until  = (event_time - now).total_seconds() / 60
+        mins_since  = (now - event_time).total_seconds() / 60
+
+        # Blackout 30 min before
+        if 0 <= mins_until <= window_minutes:
+            return True, event["name"], round(mins_until), "before"
+
+        # Blackout 15 min after
+        if 0 <= mins_since <= 15:
+            return True, event["name"], round(mins_since), "after"
+
+    return False, None, None, None
+
+def get_momentum_bias_post_event(bars):
+    """
+    After a high-impact event, determine momentum direction from price action.
+    Returns 'BULL', 'BEAR', or None if not clear enough.
+    """
+    if len(bars) < 5:
+        return None
+    recent   = bars[-1]["c"]
+    baseline = bars[-5]["c"]
+    move_pct = (recent - baseline) / baseline * 100
+
+    if move_pct > 0.3:
+        return "BULL"
+    elif move_pct < -0.3:
+        return "BEAR"
+    return None
+
 def calculate_gex(options_chain, spot):
     """
     Calculate simplified GEX (Gamma Exposure) from options chain.
@@ -552,7 +651,7 @@ Execute manually in Robinhood.
 """
     return subj, body
 
-def send_premarket_brief(vix=None, gex_zero=None, top_gex_levels=None):
+def send_premarket_brief(vix=None, gex_zero=None, top_gex_levels=None, today_events=None):
     bars = get_spx_bars(limit=100)
     if not bars:
         return
@@ -576,6 +675,16 @@ def send_premarket_brief(vix=None, gex_zero=None, top_gex_levels=None):
         conf_today  = MIN_CONFIDENCE_HIGH_VIX if vix_val and vix_val > VIX_HIGH_THRESHOLD else MIN_CONFIDENCE
 
         subj = f"SPX Pre-Market Brief — {datetime.date.today().strftime('%b %d, %Y')}"
+
+        # Format calendar events
+        events_str = "None"
+        if today_events:
+            event_lines = []
+            for e in today_events:
+                t = e["time"].strftime("%I:%M %p ET")
+                event_lines.append(f"  {t}  {e['name']}")
+            events_str = "\n".join(event_lines)
+
         body = f"""
 SPX PRE-MARKET BRIEF
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -591,13 +700,17 @@ Regime:       {regime}
 GEX Zero:     {gex_str}
 Key GEX Levels: {levels_str}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HIGH IMPACT EVENTS TODAY:
+{events_str}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Scanning:     9:00 AM - 3:30 PM ET
 Max Trades:   {MAX_TRADES_PER_DAY}/day
 Confidence:   {conf_today}%+ required today
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Signal alerts fire automatically during RTH.
+Signals suppressed 30min before / 15min after high-impact events.
 """
-        send_alert(subj, body)
+        send_email(subj, body)
     except Exception as e:
         print(f"[ERROR] premarket brief: {e}")
 
@@ -623,8 +736,11 @@ def main():
     GEX_REFRESH_MINS = 30
 
     # VIX spike tracking
-    vix_history    = []
+    vix_history     = []
     last_vix_alerts = set()
+
+    # Economic calendar
+    today_events = []
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -642,6 +758,7 @@ def main():
             last_gex_fetch   = None
             vix_history      = []
             last_vix_alerts  = set()
+            today_events     = []
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
         # Fetch VIX and update history
@@ -669,8 +786,10 @@ def main():
 
         # Pre-market brief at 6 AM ET
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
+            print(f"[{now_et.strftime('%H:%M ET')}] Fetching economic calendar...")
+            today_events = get_economic_events()
+            print(f"[{now_et.strftime('%H:%M ET')}] Found {len(today_events)} high-impact events today.")
             print(f"[{now_et.strftime('%H:%M ET')}] Sending pre-market brief...")
-            # Try to get GEX for premarket brief
             bars_pm = get_spx_bars(limit=5)
             spot_pm = bars_pm[-1]["c"] if bars_pm else 5800
             chain_pm = get_spx_options_chain()
@@ -678,7 +797,7 @@ def main():
                 gex_zero_pm, top_levels_pm, _ = calculate_gex(chain_pm, spot_pm)
             else:
                 gex_zero_pm, top_levels_pm = None, []
-            send_premarket_brief(vix=vix, gex_zero=gex_zero_pm, top_gex_levels=top_levels_pm)
+            send_premarket_brief(vix=vix, gex_zero=gex_zero_pm, top_gex_levels=top_levels_pm, today_events=today_events)
             premarket_sent = True
 
         # RTH signal loop
@@ -692,9 +811,16 @@ def main():
                     spot_now  = bars_spot[-1]["c"] if bars_spot else None
                     subj, body = format_vix_alert(alert, spot=spot_now)
                     if subj and body:
-                        send_alert(subj, body)
+                        send_email(subj, body)
                         print(f"\n[VIX ALERT] {subj}")
                         print(body)
+
+            # Economic calendar blackout check
+            in_blackout, event_name, mins_away, when = check_event_blackout(today_events)
+            if in_blackout:
+                print(f"[{now_et.strftime('%H:%M ET')}] BLACKOUT — {event_name} ({mins_away}min {when}). No signals.")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
             if trade_count >= MAX_TRADES_PER_DAY:
                 print(f"[{now_et.strftime('%H:%M ET')}] Max {MAX_TRADES_PER_DAY} trades hit. Done for today.")
