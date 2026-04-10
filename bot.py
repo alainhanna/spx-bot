@@ -68,13 +68,18 @@ def get_spx_bars(limit=60):
         f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/2020-01-01/{today}"
         f"?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
     )
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if data.get("status") in ("OK", "DELAYED") and data.get("results"):
-            return list(reversed(data["results"]))
-    except Exception as e:
-        print(f"[ERROR] bars: {e}")
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if data.get("status") in ("OK", "DELAYED") and data.get("results"):
+                return list(reversed(data["results"]))
+        except Exception as e:
+            if attempt < 2:
+                print(f"[WARN] bars fetch attempt {attempt+1} failed, retrying...")
+                time.sleep(2)
+            else:
+                print(f"[ERROR] bars after 3 attempts: {e}")
     return []
 
 def get_vix():
