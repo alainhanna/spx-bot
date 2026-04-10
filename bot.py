@@ -208,9 +208,12 @@ def calc_rsi(closes, period=14):
     return round(100 - (100 / (1 + ag / al)), 2)
 
 def calc_vwap(bars):
-    tp_vol = sum(((b["h"] + b["l"] + b["c"]) / 3) * b["v"] for b in bars)
-    vol    = sum(b["v"] for b in bars)
-    return round(tp_vol / vol, 2) if vol else None
+    try:
+        tp_vol = sum(((b["h"] + b["l"] + b["c"]) / 3) * b.get("v", 0) for b in bars)
+        vol    = sum(b.get("v", 0) for b in bars)
+        return round(tp_vol / vol, 2) if vol else None
+    except Exception:
+        return None
 
 def calc_ema(closes, period):
     if len(closes) < period:
