@@ -75,7 +75,8 @@ def get_vix():
         data = r.json()
         results = data.get("results", [])
         if results:
-            return results[0].get("value")
+            val = results[0].get("value") or results[0].get("last", {}).get("value")
+            return float(val) if val is not None else None
     except Exception as e:
         print(f"[ERROR] vix: {e}")
     return None
@@ -392,43 +393,50 @@ def send_premarket_brief(vix=None, gex_zero=None, top_gex_levels=None):
     bars = get_spx_bars(limit=100)
     if not bars:
         return
-    spot        = bars[-1]["c"]
-    vwap        = calc_vwap(bars)
-    closes      = [b["c"] for b in bars]
-    rsi         = calc_rsi(closes)
-    today_open  = bars[-1]["o"]
-    prior_close = bars[-2]["c"] if len(bars) > 1 else spot
-    gap_pct     = round(((today_open - prior_close) / prior_close) * 100, 3)
-    gap_label   = "FLAT" if abs(gap_pct) < 0.1 else ("GAP UP ▲" if gap_pct > 0 else "GAP DOWN ▼")
-    regime      = "Mean-revert favored" if abs(gap_pct) < 0.15 else ("Momentum UP" if gap_pct > 0 else "Momentum DOWN")
-    vix_str     = f"{vix:.2f}" if vix else "N/A"
-    vix_warn    = " ⚠️ HIGH VIX — signals require 75%+ confidence" if vix and vix > VIX_HIGH_THRESHOLD else ""
-    gex_str     = f"{gex_zero:,.0f}" if gex_zero else "N/A"
-    levels_str  = ", ".join([f"{l:,.0f}" for l in top_gex_levels]) if top_gex_levels else "N/A"
+    try:
+        spot        = bars[-1]["c"]
+        vwap        = calc_vwap(bars)
+        closes      = [b["c"] for b in bars]
+        rsi         = calc_rsi(closes)
+        today_open  = bars[-1].get("o", spot)
+        prior_close = bars[-2]["c"] if len(bars) > 1 else spot
+        gap_pct     = round(((today_open - prior_close) / prior_close) * 100, 3)
+        gap_label   = "FLAT" if abs(gap_pct) < 0.1 else ("GAP UP" if gap_pct > 0 else "GAP DOWN")
+        regime      = "Mean-revert favored" if abs(gap_pct) < 0.15 else ("Momentum UP" if gap_pct > 0 else "Momentum DOWN")
+        vix_val     = float(vix) if vix is not None else None
+        vix_str     = f"{vix_val:.2f}" if vix_val is not None else "N/A"
+        vix_warn    = " HIGH VIX — signals require 75%+ confidence" if vix_val and vix_val > VIX_HIGH_THRESHOLD else ""
+        gex_str     = f"{gex_zero:,.0f}" if gex_zero else "N/A"
+        levels_str  = ", ".join([f"{l:,.0f}" for l in top_gex_levels]) if top_gex_levels else "N/A"
+        vwap_str    = f"{vwap:,.2f}" if vwap else "N/A"
+        rsi_str     = str(rsi) if rsi else "N/A"
+        conf_today  = MIN_CONFIDENCE_HIGH_VIX if vix_val and vix_val > VIX_HIGH_THRESHOLD else MIN_CONFIDENCE
 
-    subj = f"☀️ SPX Pre-Market Brief — {datetime.date.today().strftime('%b %d, %Y')}"
-    body = f"""
-☀️ SPX PRE-MARKET BRIEF
+        subj = f"SPX Pre-Market Brief — {datetime.date.today().strftime('%b %d, %Y')}"
+        body = f"""
+SPX PRE-MARKET BRIEF
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {datetime.date.today().strftime('%A, %B %d, %Y')}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Spot (last):  {spot:,.2f}
-VWAP:         {vwap:,.2f}
-RSI(14):      {rsi}
+VWAP:         {vwap_str}
+RSI(14):      {rsi_str}
 VIX:          {vix_str}{vix_warn}
 Gap:          {gap_pct:+.3f}%  {gap_label}
 Regime:       {regime}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GEX Zero:     {gex_str}  ← dealer hedge pivot
+GEX Zero:     {gex_str}
 Key GEX Levels: {levels_str}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Scanning:     9:00 AM – 3:30 PM ET (all day)
+Scanning:     9:00 AM - 3:30 PM ET
 Max Trades:   {MAX_TRADES_PER_DAY}/day
-Confidence:   {MIN_CONFIDENCE_HIGH_VIX if vix and vix > VIX_HIGH_THRESHOLD else MIN_CONFIDENCE}%+ required today
+Confidence:   {conf_today}%+ required today
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Signal alerts fire automatically during RTH.
 """
-    send_email(subj, body)
+        send_email(subj, body)
+    except Exception as e:
+        print(f"[ERROR] premarket brief: {e}")
 
 # ─────────────────────────────────────────
 # MAIN LOOP
