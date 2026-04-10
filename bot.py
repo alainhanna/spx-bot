@@ -78,32 +78,37 @@ def get_spx_bars(limit=60):
     return []
 
 def get_vix():
-    """Try multiple endpoints to get VIX value"""
-    # Try 1: Indices snapshot
-    try:
-        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/indices/tickers/I:VIX?apiKey={POLYGON_API_KEY}"
-        r = requests.get(url, timeout=10)
-        text = r.text.strip()
-        if text.startswith("{"):
-            data = r.json()
-            results = data.get("results", [])
-            if results:
-                val = results[0].get("value") or results[0].get("last", {}).get("value")
-                if val is not None:
-                    return float(val)
-    except Exception:
-        pass
+    """Try multiple endpoints to get VIX value, with retry logic"""
+    for attempt in range(3):
+        # Try 1: Indices snapshot
+        try:
+            url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/indices/tickers/I:VIX?apiKey={POLYGON_API_KEY}"
+            r = requests.get(url, timeout=10)
+            text = r.text.strip()
+            if text.startswith("{"):
+                data = r.json()
+                results = data.get("results", [])
+                if results:
+                    val = results[0].get("value") or results[0].get("last", {}).get("value")
+                    if val is not None:
+                        return float(val)
+        except Exception:
+            pass
 
-    # Try 2: Previous close via aggregates
-    try:
-        today = datetime.date.today().isoformat()
-        url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/range/1/day/2020-01-01/{today}?adjusted=true&sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if data.get("results"):
-            return float(data["results"][0]["c"])
-    except Exception as e:
-        print(f"[ERROR] vix fallback: {e}")
+        # Try 2: Previous close via aggregates
+        try:
+            today = datetime.date.today().isoformat()
+            url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/range/1/day/2020-01-01/{today}?adjusted=true&sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if data.get("results"):
+                return float(data["results"][0]["c"])
+        except Exception as e:
+            if attempt < 2:
+                print(f"[WARN] VIX fetch attempt {attempt+1} failed, retrying...")
+                time.sleep(2)
+            else:
+                print(f"[ERROR] vix fallback after 3 attempts: {e}")
 
     return None
 
@@ -215,8 +220,8 @@ def check_event_blackout(events, window_minutes=30):
         if 0 <= mins_until <= window_minutes:
             return True, event["name"], round(mins_until), "before"
 
-        # Blackout 15 min after
-        if 0 <= mins_since <= 15:
+        # Blackout 1 min after
+        if 0 <= mins_since <= 1:
             return True, event["name"], round(mins_since), "after"
 
     return False, None, None, None
@@ -722,7 +727,7 @@ Max Trades:   {MAX_TRADES_PER_DAY}/day
 Confidence:   {conf_today}%+ required today
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Signal alerts fire automatically during RTH.
-Signals suppressed 30min before / 15min after high-impact events.
+Signals suppressed 30min before / 1min after high-impact events.
 """
         send_email(subj, body)
     except Exception as e:
