@@ -19,7 +19,7 @@ GMAIL_PASSWORD  = os.environ.get("GMAIL_PASSWORD")  # Gmail App Password
 PROFIT_TARGET_PCT = 45
 STOP_LOSS_PCT     = 50
 MIN_CONFIDENCE    = 65
-POLL_INTERVAL_SEC = 120  # every 2 minutes
+POLL_INTERVAL_SEC = 15  # every 2 minutes
 COOLDOWN_MINUTES  = 1
 MAX_TRADES_PER_DAY = 25
 
