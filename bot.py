@@ -46,8 +46,8 @@ def is_premarket():
 
 def in_entry_window():
     now = datetime.datetime.now(ET).time()
-    return (datetime.time(9,45) <= now <= datetime.time(11,30)) or \
-           (datetime.time(13,0) <= now <= datetime.time(14,30))
+    return (datetime.time(9,0) <= now <= datetime.time(15,30))
+           
 
 # ─────────────────────────────────────────
 # DATA FETCHING
