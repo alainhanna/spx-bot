@@ -143,48 +143,60 @@ HIGH_IMPACT_KEYWORDS = [
 
 def get_economic_events():
     """
-    Fetch today's economic events from financialmodelingprep (free tier).
-    Returns list of high-impact events with times.
+    Get today's high-impact economic events.
+    Uses two sources:
+    1. MANUAL_EVENTS — hardcoded events you add yourself (always checked first)
+    2. financialmodelingprep API — auto-fetched if available
     """
-    today = datetime.date.today().isoformat()
-    url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={today}&to={today}&apikey=demo"
+    today     = datetime.date.today()
+    today_str = today.isoformat()
+    events    = []
+
+    # ── SOURCE 1: MANUAL OVERRIDE ──────────────────────────────
+    # Add events here yourself each week. Format: "HH:MM" in ET.
+    # Example: MANUAL_EVENTS = [("08:30", "CPI"), ("14:00", "FOMC")]
+    # Clear this list when the events have passed.
+    MANUAL_EVENTS = [
+        ("08:30", "CPI — Consumer Price Index"),
+        ("10:00", "Consumer Sentiment"),
+    ]
+
+    for time_str, name in MANUAL_EVENTS:
+        try:
+            h, m = map(int, time_str.split(":"))
+            event_dt = ET.localize(datetime.datetime(today.year, today.month, today.day, h, m))
+            events.append({"name": name, "time": event_dt, "impact": "high"})
+        except Exception:
+            continue
+
+    # ── SOURCE 2: API (backup) ──────────────────────────────────
     try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return []
-        events = r.json()
-        if not isinstance(events, list):
-            return []
-
-        high_impact = []
-        for e in events:
-            name   = (e.get("event") or "").lower()
-            impact = (e.get("impact") or "").lower()
-            date   = e.get("date") or ""
-
-            # Include if marked high impact OR matches our keywords
-            is_high = impact in ("high", "critical")
-            is_keyword = any(k in name for k in HIGH_IMPACT_KEYWORDS)
-
-            if (is_high or is_keyword) and date:
-                try:
-                    # Parse event time
-                    event_dt = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
-                    event_et = ET.localize(event_dt)
-                    high_impact.append({
-                        "name": e.get("event", "Unknown"),
-                        "time": event_et,
-                        "impact": impact,
-                        "actual": e.get("actual"),
-                        "estimate": e.get("estimate"),
-                    })
-                except Exception:
-                    continue
-
-        return high_impact
+        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?from={today_str}&to={today_str}&apikey=demo"
+        r   = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            api_events = r.json()
+            if isinstance(api_events, list):
+                for e in api_events:
+                    name   = (e.get("event") or "").lower()
+                    impact = (e.get("impact") or "").lower()
+                    date   = e.get("date") or ""
+                    is_high    = impact in ("high", "critical")
+                    is_keyword = any(k in name for k in HIGH_IMPACT_KEYWORDS)
+                    if (is_high or is_keyword) and date:
+                        try:
+                            event_dt = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+                            event_et = ET.localize(event_dt)
+                            # Don't duplicate manual events
+                            already = any(abs((ev["time"] - event_et).total_seconds()) < 300 for ev in events)
+                            if not already:
+                                events.append({"name": e.get("event", "Unknown"), "time": event_et, "impact": impact})
+                        except Exception:
+                            continue
     except Exception as e:
-        print(f"[ERROR] calendar: {e}")
-    return []
+        print(f"[CALENDAR] API unavailable: {e}")
+
+    print(f"[CALENDAR] {len(events)} high-impact events today: {[e['name'] for e in events]}")
+    return events
 
 def check_event_blackout(events, window_minutes=30):
     """
