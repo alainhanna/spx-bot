@@ -547,8 +547,9 @@ def evaluate_signal(bars, vix=None, gex_zero=None, intraday_trend="NEUTRAL"):
     if spot > ema9: bull_pts += 5
     else:           bear_pts += 5
 
-    # GEX stripped — Options Basic plan doesn't include snapshot OI data
-    # Signal runs on RSI + VWAP + EMA + Momentum + Trend
+    # Trend confluence bonus
+    if intraday_trend == "BULL": bull_pts += 10
+    elif intraday_trend == "BEAR": bear_pts += 10
 
     total = bull_pts + bear_pts
     if total == 0:
