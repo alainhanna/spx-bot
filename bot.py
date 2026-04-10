@@ -74,17 +74,35 @@ def get_spx_bars(limit=60):
     return []
 
 def get_vix():
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/indices/tickers/I:VIX?apiKey={POLYGON_API_KEY}"
+    """Try multiple endpoints to get VIX value"""
+    # Try 1: Indices snapshot
     try:
+        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/indices/tickers/I:VIX?apiKey={POLYGON_API_KEY}"
+        r = requests.get(url, timeout=10)
+        text = r.text.strip()
+        if text.startswith("{"):
+            data = r.json()
+            results = data.get("results", [])
+            if results:
+                val = results[0].get("value") or results[0].get("last", {}).get("value")
+                if val is not None:
+                    return float(val)
+    except Exception:
+        pass
+
+    # Try 2: Previous close via aggregates
+    try:
+        today = datetime.date.today().isoformat()
+        url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/range/1/day/2020-01-01/{today}?adjusted=true&sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
         r = requests.get(url, timeout=10)
         data = r.json()
-        results = data.get("results", [])
-        if results:
-            val = results[0].get("value") or results[0].get("last", {}).get("value")
-            return float(val) if val is not None else None
+        if data.get("results"):
+            return float(data["results"][0]["c"])
     except Exception as e:
-        print(f"[ERROR] vix: {e}")
+        print(f"[ERROR] vix fallback: {e}")
+
     return None
+
 
 def get_spx_options_chain():
     """
