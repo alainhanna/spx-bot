@@ -321,28 +321,52 @@ def calculate_gex(options_chain, spot):
 # ─────────────────────────────────────────
 def detect_trend(bars):
     """
-    Detect intraday trend using first hour vs current price.
+    Fast momentum-based trend detection using last 10 bars.
+    Catches moves as they happen, not after session open comparison.
     Returns: 'BULL', 'BEAR', or 'NEUTRAL'
     """
-    if len(bars) < 30:
+    if len(bars) < 10:
         return "NEUTRAL"
 
-    # Compare open of session to current price
-    session_open  = bars[0]["o"]
-    current_price = bars[-1]["c"]
-    high_of_day   = max(b["h"] for b in bars)
-    low_of_day    = min(b["l"] for b in bars)
-    day_range     = high_of_day - low_of_day
+    recent = bars[-10:]
+    closes = [b["c"] for b in recent]
 
-    if day_range == 0:
-        return "NEUTRAL"
+    # Short-term momentum: compare last 3 bars to 10 bars ago
+    momentum_3  = closes[-1] - closes[-3]
+    momentum_10 = closes[-1] - closes[0]
 
-    price_position = (current_price - low_of_day) / day_range
-    move_pct = (current_price - session_open) / session_open * 100
+    # EMA slope — is the 5-bar EMA rising or falling?
+    ema5 = closes[-1]
+    k = 2 / (5 + 1)
+    for c in reversed(closes[-5:]):
+        ema5 = c * k + ema5 * (1 - k)
+    ema5_prev = closes[-5]
+    k2 = 2 / (5 + 1)
+    for c in reversed(closes[-9:-4]):
+        ema5_prev = c * k2 + ema5_prev * (1 - k2)
 
-    if move_pct > 0.15 and price_position > 0.60:
+    ema_rising  = ema5 > ema5_prev
+    ema_falling = ema5 < ema5_prev
+
+    # Count green vs red bars in last 10
+    green = sum(1 for b in recent if b["c"] > b["o"])
+    red   = sum(1 for b in recent if b["c"] < b["o"])
+
+    bull_signals = 0
+    bear_signals = 0
+
+    if momentum_3 > 1:  bull_signals += 1
+    if momentum_3 < -1: bear_signals += 1
+    if momentum_10 > 3: bull_signals += 1
+    if momentum_10 < -3: bear_signals += 1
+    if ema_rising:  bull_signals += 1
+    if ema_falling: bear_signals += 1
+    if green >= 7:  bull_signals += 1
+    if red >= 7:    bear_signals += 1
+
+    if bull_signals >= 3:
         return "BULL"
-    elif move_pct < -0.15 and price_position < 0.40:
+    elif bear_signals >= 3:
         return "BEAR"
     else:
         return "NEUTRAL"
