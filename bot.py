@@ -4,6 +4,8 @@ import time
 import datetime
 import pytz
 import os
+import threading
+from flask import Flask
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -877,5 +879,27 @@ def main():
 
         time.sleep(POLL_INTERVAL_SEC)
 
+# ─────────────────────────────────────────
+# HEALTH CHECK SERVER
+# ─────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "bot": "SPX 0DTE Signal Bot v2"}, 200
+
+@app.route("/")
+def index():
+    return {"status": "running"}, 200
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
 if __name__ == "__main__":
+    # Run health check server in background thread
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    print(f"[HEALTH] Health check server started on port {os.environ.get('PORT', 8080)}")
+    # Run bot main loop
     main()
