@@ -457,6 +457,18 @@ def main():
     today_events     = []
     key_levels       = {}
 
+    # Opening range
+    or_high          = None
+    or_low           = None
+    or_set           = False
+
+    # VIX spike tracking
+    last_vix         = None
+    last_vix_spike   = None
+
+    # Heartbeat
+    last_heartbeat   = None
+
     while True:
         now_et = datetime.datetime.now(ET)
         today  = now_et.date()
@@ -469,6 +481,12 @@ def main():
             last_date        = today
             today_events     = []
             key_levels       = {}
+            or_high          = None
+            or_low           = None
+            or_set           = False
+            last_vix         = None
+            last_vix_spike   = None
+            last_heartbeat   = None
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
         # ── Pre-market brief ─────────────────────────────────────
@@ -482,22 +500,18 @@ def main():
             prev = get_prev_day_levels()
             if prev:
                 key_levels = {
-                    "Prev Day High": prev["pdh"],
-                    "Prev Day Low":  prev["pdl"],
+                    "Prev Day High":  prev["pdh"],
+                    "Prev Day Low":   prev["pdl"],
                     "Prev Day Close": prev["pdc"],
                 }
-            # Add round numbers near current price
-            bars_pm = get_spx_bars(limit=5)
+
+            bars_pm = get_spx_bars(limit=30)
             if bars_pm:
                 spot_pm = bars_pm[-1]["c"]
-                key_levels["VWAP"] = calc_vwap(bars_pm)
-                # Add nearest round hundreds
                 round_below = (spot_pm // 100) * 100
                 round_above = round_below + 100
                 key_levels[f"Round {round_below:.0f}"] = round_below
                 key_levels[f"Round {round_above:.0f}"] = round_above
-
-                # Premarket high/low
                 pmh, pml = get_premarket_levels(bars_pm)
                 if pmh: key_levels["PM High"] = pmh
                 if pml: key_levels["PM Low"]  = pml
@@ -522,7 +536,64 @@ def main():
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # Cooldown check
+            bars = get_spx_bars(limit=60)
+            if not bars or len(bars) < 10:
+                print(f"[{now_et.strftime('%H:%M ET')}] Not enough bars.")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            spot     = bars[-1]["c"]
+            vix      = get_vix()
+            vwap     = calc_vwap(bars)
+            momentum = calc_momentum(bars, MOMENTUM_BARS)
+
+            # Update VWAP in key levels
+            if vwap:
+                key_levels["VWAP"] = vwap
+
+            vix_str = f"{vix:.1f}" if vix else "N/A"
+            print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={vwap} VIX={vix_str} Mom={momentum:+.1f} OR={or_high}/{or_low} Alerts={alert_count}/{MAX_ALERTS_PER_DAY}")
+
+            # ── Opening Range (first 15 min: 9:30-9:45) ──────────
+            market_open_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            or_end_time      = now_et.replace(hour=9, minute=45, second=0, microsecond=0)
+
+            if now_et < or_end_time:
+                # Still building opening range
+                rth_bars = [b for b in bars if b.get("t") and
+                            datetime.datetime.fromtimestamp(b["t"]/1000, ET) >= market_open_time]
+                if rth_bars:
+                    or_high = max(b["h"] for b in rth_bars)
+                    or_low  = min(b["l"] for b in rth_bars)
+                print(f"  → Building opening range: {or_low} - {or_high}")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            elif not or_set and or_high and or_low:
+                # Opening range just locked in
+                or_set = True
+                key_levels["OR High"] = round(or_high, 2)
+                key_levels["OR Low"]  = round(or_low, 2)
+                print(f"  → Opening range set: {or_low:.2f} - {or_high:.2f}")
+                send_telegram(f"📊 *Opening Range Set*\nHigh: {or_high:,.2f}\nLow: {or_low:,.2f}\nScanning for breakouts...")
+
+            # ── VIX Spike Alert ───────────────────────────────────
+            if vix and last_vix:
+                vix_chg_pct = (vix - last_vix) / last_vix * 100
+                if vix_chg_pct >= 8 and last_vix_spike != round(vix, 1):
+                    last_vix_spike = round(vix, 1)
+                    send_telegram(f"⚠️ *VIX SPIKE ALERT*\nVIX jumped {vix_chg_pct:+.1f}% → {vix:.1f}\nSPX={spot:,.2f}\nExpect volatility — wait for direction before entry")
+                    print(f"  → VIX SPIKE: {last_vix:.1f} → {vix:.1f} ({vix_chg_pct:+.1f}%)")
+            if vix:
+                last_vix = vix
+
+            # ── Hourly Heartbeat ──────────────────────────────────
+            if last_heartbeat is None or (now_et - last_heartbeat).total_seconds() >= 3600:
+                last_heartbeat = now_et
+                send_telegram(f"💓 *Bot Heartbeat* — {now_et.strftime('%I:%M %p ET')}\nSPX={spot:,.2f} | VWAP={vwap} | VIX={vix_str}\nAlerts today: {alert_count}/{MAX_ALERTS_PER_DAY}")
+                print(f"  → Heartbeat sent")
+
+            # ── Signal evaluation ─────────────────────────────────
             cooldown_ok = True
             if last_signal_time:
                 mins = (now_et - last_signal_time).total_seconds() / 60
@@ -530,33 +601,15 @@ def main():
                     cooldown_ok = False
 
             if cooldown_ok:
-                bars = get_spx_bars(limit=60)
-
-                if bars and len(bars) >= 10:
-                    spot = bars[-1]["c"]
-                    vix  = get_vix()
-                    vwap = calc_vwap(bars)
-                    momentum = calc_momentum(bars, MOMENTUM_BARS)
-
-                    # Update VWAP in key levels
-                    if vwap:
-                        key_levels["VWAP"] = vwap
-
-                    vix_str = f"{vix:.1f}" if vix else "N/A"
-                    print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={vwap} VIX={vix_str} Mom={momentum:+.1f} Alerts={alert_count}/{MAX_ALERTS_PER_DAY}")
-
-                    sig = evaluate_signal(bars, vwap, key_levels, vix=vix)
-
-                    if sig:
-                        alert_count     += 1
-                        last_signal_time = now_et
-                        msg = format_signal_message(sig, alert_count)
-                        send_telegram(msg)
-                        print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['strength']}")
-                    else:
-                        print(f"  → No signal | VWAP={vwap} Mom={momentum:+.1f}")
+                sig = evaluate_signal(bars, vwap, key_levels, vix=vix)
+                if sig:
+                    alert_count     += 1
+                    last_signal_time = now_et
+                    msg = format_signal_message(sig, alert_count)
+                    send_telegram(msg)
+                    print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['strength']}")
                 else:
-                    print(f"[{now_et.strftime('%H:%M ET')}] Not enough bars.")
+                    print(f"  → No signal | VWAP={vwap} Mom={momentum:+.1f}")
 
         elif is_market_open() and not in_entry_window():
             print(f"[{now_et.strftime('%H:%M ET')}] Outside entry window.")
