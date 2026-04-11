@@ -109,21 +109,23 @@ def get_spx_bars_yfinance(limit=60):
 def get_spx_bars(limit=60):
     today = datetime.date.today().isoformat()
     url = (
-        f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/2020-01-01/{today}"
+        f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/{today}/{today}"
         f"?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
     )
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                raise Exception(f"HTTP {r.status_code}")
             data = r.json()
-            if data.get("status") in ("OK", "DELAYED") and data.get("results"):
+            if data.get("results"):
                 return list(reversed(data["results"]))
         except Exception as e:
             if attempt < 2:
-                print(f"[WARN] Polygon bars attempt {attempt+1} failed, retrying...")
+                print(f"[WARN] Polygon bars attempt {attempt+1} failed ({e}), retrying...")
                 time.sleep(2)
             else:
-                print(f"[WARN] Polygon failed — switching to yfinance")
+                print("[WARN] Polygon failed — switching to yfinance")
                 return get_spx_bars_yfinance(limit)
     return get_spx_bars_yfinance(limit)
 
