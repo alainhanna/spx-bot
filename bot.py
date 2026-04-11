@@ -233,16 +233,12 @@ def expanding_range(bars, n=3):
 def calculate_atr(bars, period=14):
     """Calculate Average True Range over N bars"""
     if len(bars) < period + 1:
-        return None
+        return 3.0  # Safe fallback for SPX
     true_ranges = []
     for i in range(1, len(bars)):
-        high  = bars[i]["h"]
-        low   = bars[i]["l"]
-        prev_close = bars[i-1]["c"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i-1]["c"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
         true_ranges.append(tr)
-    if len(true_ranges) < period:
-        return None
     return round(sum(true_ranges[-period:]) / period, 2)
 
 # ─────────────────────────────────────────
@@ -290,13 +286,14 @@ def check_event_blackout(events, window_before=30, window_after=1):
 # ─────────────────────────────────────────
 # REGIME FILTER
 # ─────────────────────────────────────────
-def count_vwap_crosses(bars, vwap):
-    """Count how many times price crossed VWAP in bars — high count = chop"""
+def count_vwap_crosses(bars, vwap_history):
+    """Count VWAP crosses using point-in-time history for precise detection."""
     crosses = 0
+    if not vwap_history or len(vwap_history) < len(bars):
+        return 0
+    hist_v = vwap_history[-len(bars):]
     for i in range(1, len(bars)):
-        prev_c = bars[i-1]["c"]
-        curr_c = bars[i]["c"]
-        if (prev_c < vwap <= curr_c) or (prev_c > vwap >= curr_c):
+        if (bars[i-1]["c"] < hist_v[i-1] and bars[i]["c"] >= hist_v[i]) or            (bars[i-1]["c"] > hist_v[i-1] and bars[i]["c"] <= hist_v[i]):
             crosses += 1
     return crosses
 
@@ -355,8 +352,8 @@ def get_regime(vix, bars, vwap=None, vwap_history=None):
                 next_cross = (recent[i-1]["c"] > hist_v[i-1] and recent[i]["c"] <= hist_v[i])
                 if prev_cross or next_cross:
                     vwap_crosses += 1
-        elif vwap:
-            vwap_crosses = count_vwap_crosses(recent, vwap)
+        else:
+            vwap_crosses = 0  # no history available yet
 
         # Direction changes
         dir_changes = count_direction_changes(recent)
