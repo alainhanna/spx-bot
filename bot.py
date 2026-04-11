@@ -377,8 +377,9 @@ def get_regime(vix, bars, vwap=None, vwap_history=None):
 def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
     """
     Detect if today is developing into a trend day.
-    Requires 30 bars and 30 VWAP history readings (available after ~9:45 ET).
+    Requires 20 bars and 20 VWAP history readings.
     Returns: 'BULL_TREND', 'BEAR_TREND', or 'NONE'
+    Also returns 'NONE' if a prior breakout has failed and price rotated back inside OR.
     """
     if len(bars) < 20 or not vwap_history or len(vwap_history) < 20:
         return "NONE"
@@ -390,7 +391,7 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
     closes_above = sum(1 for i in range(len(recent)) if recent[i]["c"] > hist_v[i])
     closes_below = sum(1 for i in range(len(recent)) if recent[i]["c"] < hist_v[i])
 
-    # Count VWAP crosses in last 30 bars
+    # Count VWAP crosses in last 20 bars
     vwap_crosses = 0
     for i in range(1, len(recent)):
         prev_above = recent[i-1]["c"] > hist_v[i-1]
@@ -399,8 +400,17 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
             vwap_crosses += 1
 
     last_close = recent[-1]["c"]
+    last_vwap  = hist_v[-1]
     bull_break = or_high is not None and last_close > or_high
     bear_break = or_low  is not None and last_close < or_low
+
+    # Failed breakout / trend reset — price rotated back inside OR near VWAP
+    # Override any trend classification if this condition is met
+    buffer    = 2
+    inside_or = (or_low + buffer) < last_close < (or_high - buffer) if (or_high and or_low) else False
+    if inside_or and vwap_crosses >= 2 and abs(last_close - last_vwap) < 5:
+        print(f"  → Trend reset: price back inside OR, {vwap_crosses} VWAP crosses, {abs(last_close - last_vwap):.1f}pts from VWAP")
+        return "NONE"
 
     # Bull trend: price mostly above VWAP, few crosses, OR High broken and holding
     if closes_above >= 16 and vwap_crosses <= 2 and bull_break:
@@ -943,12 +953,17 @@ def main():
                 send_telegram(f"📊 *Opening Range Set*\nHigh: {or_high:,.2f}\nLow: {or_low:,.2f}\nScanning for breakouts...")
 
             # ── Trend Day Detection (runs every cycle after OR set) ──
-            if or_set and trend_day == "NONE":
-                trend_day = detect_trend_day(bars, vwap_history, or_high=or_high, or_low=or_low)
-                if trend_day != "NONE":
-                    emoji = "📈" if trend_day == "BULL_TREND" else "📉"
-                    send_telegram(f"{emoji} *Trend Day Detected: {trend_day}*\nSPX={spot:,.2f} | VWAP={vwap}\nContinuation signals prioritized. Fades suppressed.")
-                    print(f"  → TREND DAY: {trend_day}")
+            if or_set:
+                new_trend = detect_trend_day(bars, vwap_history, or_high=or_high, or_low=or_low)
+                if new_trend != trend_day:
+                    if new_trend == "NONE" and trend_day != "NONE":
+                        send_telegram(f"🔄 *Trend Reset*\nPrior {trend_day} invalidated — price back inside OR\nReturning to normal signal mode")
+                        print(f"  → TREND RESET: {trend_day} → NONE")
+                    elif new_trend != "NONE":
+                        emoji = "📈" if new_trend == "BULL_TREND" else "📉"
+                        send_telegram(f"{emoji} *Trend Day Detected: {new_trend}*\nSPX={spot:,.2f} | VWAP={vwap}\nContinuation signals prioritized. Fades suppressed.")
+                        print(f"  → TREND DAY: {new_trend}")
+                    trend_day = new_trend
 
             # ── VIX Spike Alert ───────────────────────────────────
             if vix and last_vix:
