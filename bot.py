@@ -31,6 +31,13 @@ LEVEL_PROXIMITY    = 8
 MOMENTUM_BARS      = 3
 MOMENTUM_MIN_MOVE  = 3.0   # SPX points
 
+# Hardening rules
+MIN_SIGNAL_DISTANCE  = 6    # SPX points — direction-aware price cooldown
+VWAP_FLIP_COOLDOWN   = 5    # minutes — prevents VWAP reclaim/rejection spam
+VWAP_MAX_EXTENSION   = 50   # SPX points — suppress ALL signals beyond this
+VWAP_BREAK_EXTENSION = 25   # SPX points — suppress breakout/momentum only
+MAX_SIGNAL_SCORE     = 18   # score cap to prevent runaway scoring
+
 ET = pytz.timezone("America/New_York")
 
 # ─────────────────────────────────────────
@@ -367,10 +374,12 @@ def get_exit_params(session, regime, momentum):
 # ─────────────────────────────────────────
 # SIGNAL ENGINE — VWAP + LEVELS + MOMENTUM
 # ─────────────────────────────────────────
-def evaluate_signal(bars, vwap, key_levels, vix=None):
+def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
+                    last_signal_bias=None, last_vwap_signal_time=None):
     """
-    Weighted scoring signal engine.
+    Weighted scoring signal engine with full hardening.
     Score thresholds: CHOP=14, NORMAL=7, ELEVATED=5, HIGH_VOL=4
+    Midday adds +2 to threshold.
     """
     if len(bars) < 10 or not vwap:
         return None
@@ -382,34 +391,53 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     session  = get_session(now_et)
     regime   = get_regime(vix, bars, vwap)
 
+    # Rule 6: Hard suppress ALL signals if too extended from VWAP
+    vwap_distance = abs(spot - vwap) if vwap else 0
+    if vwap_distance > VWAP_MAX_EXTENSION:
+        print(f"  → Hard suppress: {vwap_distance:.0f}pts from VWAP (>{VWAP_MAX_EXTENSION})")
+        return None
+
+    too_extended = vwap_distance > VWAP_BREAK_EXTENSION  # breakout/momentum filter only
+
+    # Rule 3: VWAP flip cooldown
+    vwap_flip_ok = True
+    if last_vwap_signal_time:
+        mins_since_vwap = (now_et - last_vwap_signal_time).total_seconds() / 60
+        if mins_since_vwap < VWAP_FLIP_COOLDOWN:
+            vwap_flip_ok = False
+
+    # Rule 2: Session score threshold adjustment
     thresholds = {"CHOP": 14, "NORMAL": 7, "ELEVATED": 5, "HIGH_VOL": 4}
     min_score  = thresholds.get(regime, 7)
+    if session == "MIDDAY":
+        min_score += 2
 
     near_any_key_level = any(
         v is not None and abs(spot - v) <= LEVEL_PROXIMITY
         for k, v in key_levels.items() if k != "VWAP"
     )
 
-    # VWAP distance — flag if price is too extended for breakout signals
-    vwap_distance = abs(spot - vwap) if vwap else 0
-    too_extended  = vwap_distance > 25  # suppress breakout/momentum signals >25pts from VWAP
-
-    # Compression boost — pre-move setup gets +2 to final score
     is_compressed = compression_detected(bars)
+
+    # Rule 4: Minimum bar range for momentum/breakout signals
+    recent_bar_range = bars[-1]["h"] - bars[-1]["l"]
+    momentum_range_ok = recent_bar_range >= 2.0
 
     signals = []
 
-    # 1. VWAP RECLAIM
+    # 1. VWAP RECLAIM — gated by flip cooldown
     if prev < vwap <= spot and bars_confirming(bars, "BULL", n=2) and momentum > 0:
-        signals.append({"trigger": "VWAP Reclaim", "bias": "BULL",
-                        "weight": score_signal("vwap_reclaim", near_any_key_level),
-                        "trigger_type": "vwap_reclaim"})
+        if vwap_flip_ok:
+            signals.append({"trigger": "VWAP Reclaim", "bias": "BULL",
+                            "weight": score_signal("vwap_reclaim", near_any_key_level),
+                            "trigger_type": "vwap_reclaim"})
 
-    # 2. VWAP REJECTION
+    # 2. VWAP REJECTION — gated by flip cooldown
     if prev > vwap >= spot and bars_confirming(bars, "BEAR", n=2) and momentum < 0:
-        signals.append({"trigger": "VWAP Rejection", "bias": "BEAR",
-                        "weight": score_signal("vwap_rejection", near_any_key_level),
-                        "trigger_type": "vwap_rejection"})
+        if vwap_flip_ok:
+            signals.append({"trigger": "VWAP Rejection", "bias": "BEAR",
+                            "weight": score_signal("vwap_rejection", near_any_key_level),
+                            "trigger_type": "vwap_rejection"})
 
     # 3. KEY LEVEL REACTIONS
     for name, level in key_levels.items():
@@ -426,28 +454,34 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
         else:
             btype, dtype = "level_breakout", "level_breakout"
 
+        # Breakout — Rule 3(ext) + Rule 7(OR afternoon) + Rule 4+9(momentum range)
         if near and prev <= level < spot and momentum > MOMENTUM_MIN_MOVE:
-            if not too_extended:  # suppress breakouts far from VWAP
+            is_or = "OR" in name
+            if not too_extended and not (is_or and session == "AFTERNOON") and momentum_range_ok:
                 signals.append({"trigger": f"Breakout above {name} ({level:,.0f})", "bias": "BULL",
                                 "weight": score_signal(btype), "trigger_type": btype})
 
+        # Breakdown — Rule 3(ext) + Rule 7(OR afternoon) + Rule 4+9(momentum range)
         if near and prev >= level > spot and momentum < -MOMENTUM_MIN_MOVE:
-            if not too_extended:  # suppress breakdowns far from VWAP
+            is_or = "OR" in name
+            if not too_extended and not (is_or and session == "AFTERNOON") and momentum_range_ok:
                 signals.append({"trigger": f"Breakdown below {name} ({level:,.0f})", "bias": "BEAR",
                                 "weight": score_signal(dtype), "trigger_type": dtype})
 
-        if near and spot < level and bars_confirming(bars, "BEAR", n=2) and momentum < -MOMENTUM_MIN_MOVE:
+        # Rejection — NOT filtered by extension, slower momentum ok (Rule 9 does not apply)
+        if near and spot < level and bars_confirming(bars, "BEAR", n=2) and momentum < -MOMENTUM_MIN_MOVE * 0.5:
             signals.append({"trigger": f"Rejection at {name} ({level:,.0f})", "bias": "BEAR",
                             "weight": score_signal("level_rejection"), "trigger_type": "level_rejection"})
 
-        if near and spot > level and bars_confirming(bars, "BULL", n=2) and momentum > MOMENTUM_MIN_MOVE:
+        # Support hold — NOT filtered by extension, slower momentum ok (Rule 9 does not apply)
+        if near and spot > level and bars_confirming(bars, "BULL", n=2) and momentum > MOMENTUM_MIN_MOVE * 0.5:
             signals.append({"trigger": f"Support hold at {name} ({level:,.0f})", "bias": "BULL",
                             "weight": score_signal("level_support"), "trigger_type": "level_support"})
 
-    # 4. MOMENTUM SURGE — suppress if too extended from VWAP
+    # 4. MOMENTUM SURGE — suppressed if extended or weak bar range
     if abs(momentum) > MOMENTUM_MIN_MOVE * 2 and expanding_range(bars, n=3):
         bias = "BULL" if momentum > 0 else "BEAR"
-        if bars_confirming(bars, bias, n=3) and not too_extended:
+        if bars_confirming(bars, bias, n=3) and not too_extended and momentum_range_ok:
             signals.append({"trigger": f"Momentum surge ({momentum:+.1f} pts)", "bias": bias,
                             "weight": score_signal("momentum_surge"), "trigger_type": "momentum_surge"})
 
@@ -466,15 +500,36 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     else:
         return None
 
-    # Compression boost — only when there's actual follow-through momentum
+    # Rule 1: Direction-aware signal distance filter
+    if last_signal_price and last_signal_bias:
+        price_dist = abs(spot - last_signal_price)
+        if price_dist < MIN_SIGNAL_DISTANCE and dominant_bias == last_signal_bias:
+            print(f"  → Distance filter: same dir, only {price_dist:.1f}pts from last signal")
+            return None
+
+    # Rule 5: Trend persistence — suppress countertrend only (no boost)
+    if len(bars) >= 10:
+        trend_up   = bars[-1]["c"] > bars[-5]["c"] > bars[-10]["c"]
+        trend_down = bars[-1]["c"] < bars[-5]["c"] < bars[-10]["c"]
+        if dominant_bias == "BULL" and trend_down:
+            dominant_score -= 2
+            print(f"  → Countertrend penalty -2 (BULL vs downtrend)")
+        if dominant_bias == "BEAR" and trend_up:
+            dominant_score -= 2
+            print(f"  → Countertrend penalty -2 (BEAR vs uptrend)")
+
+    # Compression boost — only with momentum confirmation
     if is_compressed and abs(momentum) > MOMENTUM_MIN_MOVE:
         dominant_score += 2
-        print(f"  → Compression boost applied (+2)")
+        print(f"  → Compression boost +2")
 
-    print(f"  → Score: BULL={bull_score} BEAR={bear_score} final={dominant_score} min={min_score} regime={regime} session={session} extended={too_extended}")
+    # Rule 8: Score cap
+    dominant_score = min(dominant_score, MAX_SIGNAL_SCORE)
+
+    print(f"  → Score: BULL={bull_score} BEAR={bear_score} final={dominant_score} min={min_score} regime={regime} session={session} ext={vwap_distance:.0f}pts")
 
     if dominant_score < min_score:
-        print(f"  → Blocked: score {dominant_score} < {min_score}")
+        print(f"  → Blocked: {dominant_score} < {min_score}")
         return None
 
     quality = "STRONG" if dominant_score >= 14 else "HIGH" if dominant_score >= 7 else "MEDIUM"
@@ -499,26 +554,28 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
         no_chase    = round(spot - 3, 2)
 
     return {
-        "trigger":     best["trigger"],
-        "quality":     quality,
-        "score":       dominant_score,
-        "regime":      regime,
-        "session":     session,
-        "bias":        dominant_bias,
-        "option_type": option_type,
-        "spot":        round(spot, 2),
-        "strike":      strike,
-        "vwap":        vwap,
-        "momentum":    momentum,
-        "invalidate":  invalidate,
-        "target_1":    target_1,
-        "target_2":    target_2,
-        "no_chase":    no_chase,
-        "stop_pct":    exit_p["stop_pct"],
-        "time_stop":   "3:45 PM ET",
-        "vix":         vix,
-        "all_signals": [s["trigger"] for s in dominant_sigs],
+        "trigger":         best["trigger"],
+        "quality":         quality,
+        "score":           dominant_score,
+        "regime":          regime,
+        "session":         session,
+        "bias":            dominant_bias,
+        "option_type":     option_type,
+        "spot":            round(spot, 2),
+        "strike":          strike,
+        "vwap":            vwap,
+        "momentum":        momentum,
+        "invalidate":      invalidate,
+        "target_1":        target_1,
+        "target_2":        target_2,
+        "no_chase":        no_chase,
+        "stop_pct":        exit_p["stop_pct"],
+        "time_stop":       "3:45 PM ET",
+        "vix":             vix,
+        "all_signals":     [s["trigger"] for s in dominant_sigs],
+        "is_vwap_trigger": best["trigger_type"] in ["vwap_reclaim", "vwap_rejection"],
     }
+
 
 
 # ─────────────────────────────────────────
@@ -644,7 +701,10 @@ def main():
     last_vix_spike   = None
 
     # Heartbeat
-    last_heartbeat   = None
+    last_heartbeat       = None
+    last_signal_price    = None
+    last_signal_bias     = None
+    last_vwap_signal_time = None
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -661,9 +721,12 @@ def main():
             or_high          = None
             or_low           = None
             or_set           = False
-            last_vix         = None
-            last_vix_spike   = None
-            last_heartbeat   = None
+            last_vix              = None
+            last_vix_spike        = None
+            last_heartbeat        = None
+            last_signal_price     = None
+            last_signal_bias      = None
+            last_vwap_signal_time = None
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
         # ── Pre-market brief ─────────────────────────────────────
@@ -778,10 +841,19 @@ def main():
                     cooldown_ok = False
 
             if cooldown_ok:
-                sig = evaluate_signal(bars, vwap, key_levels, vix=vix)
+                sig = evaluate_signal(
+                    bars, vwap, key_levels, vix=vix,
+                    last_signal_price=last_signal_price,
+                    last_signal_bias=last_signal_bias,
+                    last_vwap_signal_time=last_vwap_signal_time
+                )
                 if sig:
-                    alert_count     += 1
-                    last_signal_time = now_et
+                    alert_count          += 1
+                    last_signal_time      = now_et
+                    last_signal_price     = sig["spot"]
+                    last_signal_bias      = sig["bias"]
+                    if sig.get("is_vwap_trigger"):
+                        last_vwap_signal_time = now_et
                     msg = format_signal_message(sig, alert_count)
                     send_telegram(msg)
                     print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['quality']} (score={sig['score']})")
