@@ -363,6 +363,47 @@ def get_regime(vix, bars, vwap=None, vwap_history=None):
     return base_regime
 
 # ─────────────────────────────────────────
+# TREND DAY DETECTION
+# ─────────────────────────────────────────
+def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
+    """
+    Detect if today is developing into a trend day.
+    Requires 30 bars and 30 VWAP history readings (available after ~9:45 ET).
+    Returns: 'BULL_TREND', 'BEAR_TREND', or 'NONE'
+    """
+    if len(bars) < 30 or not vwap_history or len(vwap_history) < 30:
+        return "NONE"
+
+    recent = bars[-30:]
+    hist_v = vwap_history[-30:]
+
+    # Count bars above/below VWAP
+    closes_above = sum(1 for i in range(len(recent)) if recent[i]["c"] > hist_v[i])
+    closes_below = sum(1 for i in range(len(recent)) if recent[i]["c"] < hist_v[i])
+
+    # Count VWAP crosses in last 30 bars
+    vwap_crosses = 0
+    for i in range(1, len(recent)):
+        prev_above = recent[i-1]["c"] > hist_v[i-1]
+        curr_above = recent[i]["c"] > hist_v[i]
+        if prev_above != curr_above:
+            vwap_crosses += 1
+
+    last_close = recent[-1]["c"]
+    bull_break = or_high is not None and last_close > or_high
+    bear_break = or_low  is not None and last_close < or_low
+
+    # Bull trend: price mostly above VWAP, few crosses, OR High broken and holding
+    if closes_above >= 24 and vwap_crosses <= 2 and bull_break:
+        return "BULL_TREND"
+
+    # Bear trend: price mostly below VWAP, few crosses, OR Low broken and holding
+    if closes_below >= 24 and vwap_crosses <= 2 and bear_break:
+        return "BEAR_TREND"
+
+    return "NONE"
+
+# ─────────────────────────────────────────
 # WEIGHTED SIGNAL SCORING
 # ─────────────────────────────────────────
 TRIGGER_WEIGHTS = {
@@ -413,7 +454,8 @@ def get_exit_params(session, regime, momentum):
 # SIGNAL ENGINE — VWAP + LEVELS + MOMENTUM
 # ─────────────────────────────────────────
 def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
-                    last_signal_bias=None, last_vwap_signal_time=None, vwap_history=None):
+                    last_signal_bias=None, last_vwap_signal_time=None,
+                    vwap_history=None, trend_day="NONE"):
     """
     Weighted scoring signal engine with full hardening.
     Score thresholds: CHOP=14, NORMAL=7, ELEVATED=5, HIGH_VOL=4
@@ -435,7 +477,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
         print(f"  → Hard suppress: {vwap_distance:.0f}pts from VWAP (>{VWAP_MAX_EXTENSION})")
         return None
 
-    too_extended = vwap_distance > VWAP_BREAK_EXTENSION  # breakout/momentum filter only
+    too_extended = vwap_distance > vwap_break_ext  # breakout/momentum filter only
 
     # Rule 3: VWAP flip cooldown
     vwap_flip_ok = True
@@ -449,6 +491,21 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
     min_score  = thresholds.get(regime, 7)
     if session == "MIDDAY":
         min_score += 2
+
+    # Trend day threshold adjustments
+    # Continuation signals easier, countertrend harder
+    trend_day_bias = None
+    if trend_day == "BULL_TREND":
+        trend_day_bias = "BULL"
+        print(f"  → BULL TREND DAY: lowering bull threshold, raising bear threshold")
+    elif trend_day == "BEAR_TREND":
+        trend_day_bias = "BEAR"
+        print(f"  → BEAR TREND DAY: lowering bear threshold, raising bull threshold")
+
+    # Extension threshold — widen in trend direction on trend days
+    vwap_break_ext = VWAP_BREAK_EXTENSION  # default 25pts
+    if trend_day_bias:
+        vwap_break_ext = 35  # allow continuation further from VWAP on trend days
 
     near_any_key_level = any(
         v is not None and abs(spot - v) <= LEVEL_PROXIMITY
@@ -545,6 +602,13 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
             print(f"  → Distance filter: same dir, only {price_dist:.1f}pts from last signal")
             return None
 
+    # Trend day threshold adjustment — applied per dominant direction
+    if trend_day_bias:
+        if dominant_bias == trend_day_bias:
+            min_score -= 1  # continuation: easier to fire
+        else:
+            min_score += 2  # countertrend: much harder to fire
+
     # Rule 5: Trend persistence — suppress countertrend only (no boost)
     if len(bars) >= 10:
         trend_up   = bars[-1]["c"] > bars[-5]["c"] > bars[-10]["c"]
@@ -564,7 +628,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
     # Rule 8: Score cap
     dominant_score = min(dominant_score, MAX_SIGNAL_SCORE)
 
-    print(f"  → Score: BULL={bull_score} BEAR={bear_score} final={dominant_score} min={min_score} regime={regime} session={session} ext={vwap_distance:.0f}pts")
+    print(f"  → Score: BULL={bull_score} BEAR={bear_score} final={dominant_score} min={min_score} regime={regime} session={session} trend={trend_day} ext={vwap_distance:.0f}pts")
 
     if dominant_score < min_score:
         print(f"  → Blocked: {dominant_score} < {min_score}")
@@ -612,6 +676,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
         "vix":             vix,
         "all_signals":     [s["trigger"] for s in dominant_sigs],
         "is_vwap_trigger": best["trigger_type"] in ["vwap_reclaim", "vwap_rejection"],
+        "trend_day":       trend_day,
     }
 
 
@@ -654,11 +719,12 @@ def format_signal_message(sig, alert_count):
     }
     regime_str  = regime_labels.get(sig["regime"], sig["regime"])
     session_str = sig.get("session", "")
+    trend_str   = f" | {'📈 Bull Trend' if sig.get('trend_day') == 'BULL_TREND' else '📉 Bear Trend' if sig.get('trend_day') == 'BEAR_TREND' else ''}" if sig.get("trend_day") != "NONE" else ""
 
     msg = f"""*SPX 0DTE SIGNAL {emoji} {sig['option_type']}*
 ━━━━━━━━━━━━━━━━━━━━━━
 *Quality:*  {badge} (score: {sig['score']})
-*Regime:*   {regime_str} | {session_str}
+*Regime:*   {regime_str} | {session_str}{trend_str}
 *Trigger:*  {sig['trigger']}
 *Time:*     {t}
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -744,6 +810,7 @@ def main():
     last_signal_bias      = None
     last_vwap_signal_time  = None
     vwap_history           = []
+    trend_day              = "NONE"
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -767,6 +834,7 @@ def main():
             last_signal_bias      = None
             last_vwap_signal_time  = None
             vwap_history           = []
+            trend_day              = "NONE"
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
         # ── Pre-market brief ─────────────────────────────────────
@@ -860,6 +928,14 @@ def main():
                 print(f"  → Opening range set: {or_low:.2f} - {or_high:.2f}")
                 send_telegram(f"📊 *Opening Range Set*\nHigh: {or_high:,.2f}\nLow: {or_low:,.2f}\nScanning for breakouts...")
 
+            # ── Trend Day Detection (runs every cycle after OR set) ──
+            if or_set and trend_day == "NONE":
+                trend_day = detect_trend_day(bars, vwap_history, or_high=or_high, or_low=or_low)
+                if trend_day != "NONE":
+                    emoji = "📈" if trend_day == "BULL_TREND" else "📉"
+                    send_telegram(f"{emoji} *Trend Day Detected: {trend_day}*\nSPX={spot:,.2f} | VWAP={vwap}\nContinuation signals prioritized. Fades suppressed.")
+                    print(f"  → TREND DAY: {trend_day}")
+
             # ── VIX Spike Alert ───────────────────────────────────
             if vix and last_vix:
                 vix_chg_pct = (vix - last_vix) / last_vix * 100
@@ -889,7 +965,8 @@ def main():
                     last_signal_price=last_signal_price,
                     last_signal_bias=last_signal_bias,
                     last_vwap_signal_time=last_vwap_signal_time,
-                    vwap_history=vwap_history
+                    vwap_history=vwap_history,
+                    trend_day=trend_day
                 )
                 if sig:
                     alert_count          += 1
