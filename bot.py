@@ -14,9 +14,17 @@ from flask import Flask
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "1u0RUGbackck5ayq2Ab05ErcVPDEs5pl")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8796616207:AAEUsEl45pRz92mYXVSUIEFUW1t-CNepGdY")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6459251326")
+POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Fail loudly if credentials missing
+if not POLYGON_API_KEY:
+    raise ValueError("POLYGON_API_KEY environment variable not set")
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN environment variable not set")
+if not TELEGRAM_CHAT_ID:
+    raise ValueError("TELEGRAM_CHAT_ID environment variable not set")
 
 POLL_INTERVAL_SEC  = 15
 COOLDOWN_MINUTES   = 1
@@ -74,7 +82,7 @@ def get_spx_bars_yfinance(limit=60):
         if spx.empty:
             return []
         # Filter to today only
-        today = datetime.date.today()
+        today = datetime.datetime.now(ET).date()
         spx = spx[spx.index.date == today]
         spx = spx.tail(limit)
         bars = []
@@ -163,7 +171,7 @@ def get_premarket_levels(bars):
     if not bars:
         return None, None
     pm_bars = [b for b in bars if b.get("t") and
-               datetime.datetime.fromtimestamp(b["t"]/1000, ET).hour < 9]
+               datetime.datetime.fromtimestamp(b["t"]/1000, ET).time() < datetime.time(9, 30)]
     if not pm_bars:
         return None, None
     pmh = max(b["h"] for b in pm_bars)
