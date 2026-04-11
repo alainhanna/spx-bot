@@ -741,7 +741,7 @@ def main():
                     last_signal_time = now_et
                     msg = format_signal_message(sig, alert_count)
                     send_telegram(msg)
-                    print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['strength']}")
+                    print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['quality']} (score={sig['score']})")
                 else:
                     print(f"  → No signal | VWAP={vwap} Mom={momentum:+.1f}")
 
