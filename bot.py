@@ -419,6 +419,22 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
 
     return "NONE"
 
+def detect_trend_acceleration(bars):
+    """
+    Detects when a confirmed trend day transitions into a runaway move.
+    Characteristics: 4-5 consecutive directional candles, expanding ranges,
+    momentum rapidly increasing, price separating from VWAP.
+    Only meaningful when trend_day is already confirmed.
+    """
+    if len(bars) < 5:
+        return False
+    last5    = bars[-5:]
+    momentum = last5[-1]["c"] - last5[0]["c"]
+    ranges   = [b["h"] - b["l"] for b in last5]
+    expanding   = ranges[-1] > ranges[0]
+    strong_move = abs(momentum) > 8
+    return strong_move and expanding
+
 # ─────────────────────────────────────────
 # WEIGHTED SIGNAL SCORING
 # ─────────────────────────────────────────
@@ -495,8 +511,13 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
 
     # Extension threshold — widen in trend direction on trend days (must be before too_extended)
     vwap_break_ext = VWAP_BREAK_EXTENSION  # default 25pts
+    accelerating   = False
     if trend_day == "BULL_TREND" or trend_day == "BEAR_TREND":
         vwap_break_ext = 35  # allow continuation further from VWAP on trend days
+        accelerating   = detect_trend_acceleration(bars)
+        if accelerating:
+            vwap_break_ext = 45  # runaway move — wider extension allowed
+            print(f"  → TREND ACCELERATION detected: extension widened to {vwap_break_ext}pts")
 
     too_extended = vwap_distance > vwap_break_ext  # breakout/momentum filter only
 
@@ -622,6 +643,9 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
     if trend_day_bias:
         if dominant_bias == trend_day_bias:
             min_score -= 1  # continuation: easier to fire
+            if accelerating:
+                min_score -= 1  # acceleration: even easier (-2 total vs base)
+                print(f"  → Acceleration bonus: min_score reduced by additional 1")
         else:
             min_score += 2  # countertrend: much harder to fire
 
