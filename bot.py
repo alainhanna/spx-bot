@@ -466,8 +466,8 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     else:
         return None
 
-    # Compression boost — add +2 if price was compressed before this move
-    if is_compressed:
+    # Compression boost — only when there's actual follow-through momentum
+    if is_compressed and abs(momentum) > MOMENTUM_MIN_MOVE:
         dominant_score += 2
         print(f"  → Compression boost applied (+2)")
 
