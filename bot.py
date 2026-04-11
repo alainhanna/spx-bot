@@ -167,9 +167,20 @@ def get_premarket_levels(bars):
 # INDICATORS
 # ─────────────────────────────────────────
 def calc_vwap(bars):
+    """Calculate VWAP using RTH bars only (9:30 AM ET onwards)"""
     try:
-        tp_vol = sum(((b["h"] + b["l"] + b["c"]) / 3) * b.get("v", 0) for b in bars)
-        vol    = sum(b.get("v", 0) for b in bars)
+        rth_bars = []
+        for b in bars:
+            if b.get("t"):
+                bar_time = datetime.datetime.fromtimestamp(b["t"]/1000, ET)
+                if bar_time.hour > 9 or (bar_time.hour == 9 and bar_time.minute >= 30):
+                    rth_bars.append(b)
+            else:
+                rth_bars.append(b)  # no timestamp — include by default
+        if not rth_bars:
+            return None
+        tp_vol = sum(((b["h"] + b["l"] + b["c"]) / 3) * b.get("v", 0) for b in rth_bars)
+        vol    = sum(b.get("v", 0) for b in rth_bars)
         return round(tp_vol / vol, 2) if vol else None
     except:
         return None
