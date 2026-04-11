@@ -213,6 +213,21 @@ def expanding_range(bars, n=3):
     ranges = [b["h"] - b["l"] for b in bars[-n:]]
     return ranges[-1] > ranges[0]
 
+def calculate_atr(bars, period=14):
+    """Calculate Average True Range over N bars"""
+    if len(bars) < period + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(bars)):
+        high  = bars[i]["h"]
+        low   = bars[i]["l"]
+        prev_close = bars[i-1]["c"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+    if len(true_ranges) < period:
+        return None
+    return round(sum(true_ranges[-period:]) / period, 2)
+
 # ─────────────────────────────────────────
 # ECONOMIC CALENDAR
 # ─────────────────────────────────────────
@@ -291,11 +306,13 @@ def compression_detected(bars):
     avg_prior  = sum(prior_ranges) / len(prior_ranges)
     return avg_recent < avg_prior * 0.6  # recent range < 60% of prior = compression
 
-def get_regime(vix, bars, vwap=None):
+def get_regime(vix, bars, vwap=None, vwap_history=None):
     """
-    Classify market regime using VIX + price structure + VWAP crosses + direction changes.
+    Classify market regime using VIX + ATR-relative chop detection
+    + point-in-time VWAP crosses + direction changes.
     Returns: 'HIGH_VOL', 'ELEVATED', 'NORMAL', 'CHOP'
     """
+    # Macro filter (VIX)
     if vix and vix >= 30:
         base_regime = "HIGH_VOL"
     elif vix and vix >= 20:
@@ -303,23 +320,36 @@ def get_regime(vix, bars, vwap=None):
     else:
         base_regime = "NORMAL"
 
-    # Chop detection using range, VWAP crosses, AND direction changes
     if len(bars) >= 20:
-        recent       = bars[-20:]
-        recent_high  = max(b["h"] for b in recent)
-        recent_low   = min(b["l"] for b in recent)
-        range_pts    = recent_high - recent_low
-        vwap_crosses = count_vwap_crosses(recent, vwap) if vwap else 0
-        dir_changes  = count_direction_changes(recent)
+        recent    = bars[-20:]
+        range_pts = max(b["h"] for b in recent) - min(b["l"] for b in recent)
 
-        # Tight range + lots of VWAP crosses = chop
-        if range_pts < 12 and vwap_crosses >= 4:
+        # ATR-relative thresholds
+        atr      = calculate_atr(bars, period=14)
+        is_tight = range_pts < (atr * 2.8) if atr else range_pts < 12
+        is_dead  = range_pts < (atr * 1.5) if atr else range_pts < 7
+
+        # Point-in-time VWAP crosses using vwap_history
+        vwap_crosses = 0
+        if vwap_history and len(vwap_history) >= 20:
+            hist_v = vwap_history[-20:]
+            for i in range(1, len(recent)):
+                prev_cross = (recent[i-1]["c"] < hist_v[i-1] and recent[i]["c"] >= hist_v[i])
+                next_cross = (recent[i-1]["c"] > hist_v[i-1] and recent[i]["c"] <= hist_v[i])
+                if prev_cross or next_cross:
+                    vwap_crosses += 1
+        elif vwap:
+            vwap_crosses = count_vwap_crosses(recent, vwap)
+
+        # Direction changes
+        dir_changes = count_direction_changes(recent)
+
+        # Chop classification
+        if is_tight and vwap_crosses >= 4:
             return "CHOP"
-        # Extremely tight range = chop
-        if range_pts < 7:
+        if is_dead:
             return "CHOP"
-        # Wide range but constant reversals = chop (catches wide choppy days)
-        if dir_changes >= 8:
+        if dir_changes >= 8 and (vwap_crosses >= 3 or is_tight):
             return "CHOP"
 
     return base_regime
@@ -375,7 +405,7 @@ def get_exit_params(session, regime, momentum):
 # SIGNAL ENGINE — VWAP + LEVELS + MOMENTUM
 # ─────────────────────────────────────────
 def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
-                    last_signal_bias=None, last_vwap_signal_time=None):
+                    last_signal_bias=None, last_vwap_signal_time=None, vwap_history=None):
     """
     Weighted scoring signal engine with full hardening.
     Score thresholds: CHOP=14, NORMAL=7, ELEVATED=5, HIGH_VOL=4
@@ -389,7 +419,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
     momentum = calc_momentum(bars, MOMENTUM_BARS)
     now_et   = datetime.datetime.now(ET)
     session  = get_session(now_et)
-    regime   = get_regime(vix, bars, vwap)
+    regime   = get_regime(vix, bars, vwap, vwap_history=vwap_history)
 
     # Rule 6: Hard suppress ALL signals if too extended from VWAP
     vwap_distance = abs(spot - vwap) if vwap else 0
@@ -703,8 +733,9 @@ def main():
     # Heartbeat
     last_heartbeat       = None
     last_signal_price    = None
-    last_signal_bias     = None
-    last_vwap_signal_time = None
+    last_signal_bias      = None
+    last_vwap_signal_time  = None
+    vwap_history           = []
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -726,7 +757,8 @@ def main():
             last_heartbeat        = None
             last_signal_price     = None
             last_signal_bias      = None
-            last_vwap_signal_time = None
+            last_vwap_signal_time  = None
+            vwap_history           = []
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
         # ── Pre-market brief ─────────────────────────────────────
@@ -787,9 +819,12 @@ def main():
             vwap     = calc_vwap(bars)
             momentum = calc_momentum(bars, MOMENTUM_BARS)
 
-            # Update VWAP in key levels
+            # Update VWAP in key levels and history
             if vwap:
                 key_levels["VWAP"] = vwap
+                vwap_history.append(vwap)
+                if len(vwap_history) > 60:  # keep last 60 readings
+                    vwap_history.pop(0)
 
             vix_str = f"{vix:.1f}" if vix else "N/A"
             print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={vwap} VIX={vix_str} Mom={momentum:+.1f} OR={or_high}/{or_low} Alerts={alert_count}/{MAX_ALERTS_PER_DAY}")
@@ -845,7 +880,8 @@ def main():
                     bars, vwap, key_levels, vix=vix,
                     last_signal_price=last_signal_price,
                     last_signal_bias=last_signal_bias,
-                    last_vwap_signal_time=last_vwap_signal_time
+                    last_vwap_signal_time=last_vwap_signal_time,
+                    vwap_history=vwap_history
                 )
                 if sig:
                     alert_count          += 1
