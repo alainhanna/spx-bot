@@ -127,20 +127,29 @@ def get_spx_bars(limit=60):
                 return get_spx_bars_yfinance(limit)
     return get_spx_bars_yfinance(limit)
 
+# VIX cache — avoid fetching more than once per minute
+_vix_cache = {"value": None, "ts": None}
+
 def get_vix():
+    now = datetime.datetime.now(ET)
+    if _vix_cache["ts"] and (now - _vix_cache["ts"]).total_seconds() < 60:
+        return _vix_cache["value"]
     for attempt in range(3):
         try:
             url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/range/1/day/2020-01-01/{datetime.date.today().isoformat()}?adjusted=true&sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
             r = requests.get(url, timeout=10)
             data = r.json()
             if data.get("results"):
-                return float(data["results"][0]["c"])
+                val = float(data["results"][0]["c"])
+                _vix_cache["value"] = val
+                _vix_cache["ts"]    = now
+                return val
         except Exception as e:
             if attempt < 2:
                 time.sleep(2)
             else:
                 print(f"[WARN] VIX unavailable: {e}")
-    return None
+    return _vix_cache["value"]  # return last cached value if fetch fails
 
 def get_prev_day_levels():
     """Get prior day high and low for key levels"""
@@ -371,11 +380,11 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
     Requires 30 bars and 30 VWAP history readings (available after ~9:45 ET).
     Returns: 'BULL_TREND', 'BEAR_TREND', or 'NONE'
     """
-    if len(bars) < 30 or not vwap_history or len(vwap_history) < 30:
+    if len(bars) < 20 or not vwap_history or len(vwap_history) < 20:
         return "NONE"
 
-    recent = bars[-30:]
-    hist_v = vwap_history[-30:]
+    recent = bars[-20:]
+    hist_v = vwap_history[-20:]
 
     # Count bars above/below VWAP
     closes_above = sum(1 for i in range(len(recent)) if recent[i]["c"] > hist_v[i])
@@ -394,11 +403,11 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
     bear_break = or_low  is not None and last_close < or_low
 
     # Bull trend: price mostly above VWAP, few crosses, OR High broken and holding
-    if closes_above >= 24 and vwap_crosses <= 2 and bull_break:
+    if closes_above >= 16 and vwap_crosses <= 2 and bull_break:
         return "BULL_TREND"
 
     # Bear trend: price mostly below VWAP, few crosses, OR Low broken and holding
-    if closes_below >= 24 and vwap_crosses <= 2 and bear_break:
+    if closes_below >= 16 and vwap_crosses <= 2 and bear_break:
         return "BEAR_TREND"
 
     return "NONE"
@@ -477,6 +486,11 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
         print(f"  → Hard suppress: {vwap_distance:.0f}pts from VWAP (>{VWAP_MAX_EXTENSION})")
         return None
 
+    # Extension threshold — widen in trend direction on trend days (must be before too_extended)
+    vwap_break_ext = VWAP_BREAK_EXTENSION  # default 25pts
+    if trend_day == "BULL_TREND" or trend_day == "BEAR_TREND":
+        vwap_break_ext = 35  # allow continuation further from VWAP on trend days
+
     too_extended = vwap_distance > vwap_break_ext  # breakout/momentum filter only
 
     # Rule 3: VWAP flip cooldown
@@ -501,11 +515,6 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
     elif trend_day == "BEAR_TREND":
         trend_day_bias = "BEAR"
         print(f"  → BEAR TREND DAY: lowering bear threshold, raising bull threshold")
-
-    # Extension threshold — widen in trend direction on trend days
-    vwap_break_ext = VWAP_BREAK_EXTENSION  # default 25pts
-    if trend_day_bias:
-        vwap_break_ext = 35  # allow continuation further from VWAP on trend days
 
     near_any_key_level = any(
         v is not None and abs(spot - v) <= LEVEL_PROXIMITY
@@ -632,6 +641,11 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
 
     if dominant_score < min_score:
         print(f"  → Blocked: {dominant_score} < {min_score}")
+        return None
+
+    # Final momentum sanity check — prevent signals on extremely slow drift
+    if abs(momentum) < MOMENTUM_MIN_MOVE:
+        print(f"  → Final sanity: momentum {momentum:+.1f} below minimum, no signal")
         return None
 
     quality = "STRONG" if dominant_score >= 14 else "HIGH" if dominant_score >= 7 else "MEDIUM"
