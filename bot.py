@@ -261,9 +261,32 @@ def count_vwap_crosses(bars, vwap):
             crosses += 1
     return crosses
 
+def count_direction_changes(bars):
+    """Count bar-to-bar direction reversals — high count = chop even on wide range days"""
+    changes = 0
+    for i in range(2, len(bars)):
+        prev_move = bars[i-1]["c"] - bars[i-2]["c"]
+        curr_move = bars[i]["c"] - bars[i-1]["c"]
+        if prev_move * curr_move < 0:  # opposite signs = reversal
+            changes += 1
+    return changes
+
+def compression_detected(bars):
+    """
+    Detect pre-move compression: recent bars have tighter range than prior bars.
+    Compression -> expansion is a high-quality setup signal.
+    """
+    if len(bars) < 30:
+        return False
+    recent_ranges = [b["h"] - b["l"] for b in bars[-10:]]
+    prior_ranges  = [b["h"] - b["l"] for b in bars[-30:-10]]
+    avg_recent = sum(recent_ranges) / len(recent_ranges)
+    avg_prior  = sum(prior_ranges) / len(prior_ranges)
+    return avg_recent < avg_prior * 0.6  # recent range < 60% of prior = compression
+
 def get_regime(vix, bars, vwap=None):
     """
-    Classify market regime using VIX + price structure + VWAP crosses.
+    Classify market regime using VIX + price structure + VWAP crosses + direction changes.
     Returns: 'HIGH_VOL', 'ELEVATED', 'NORMAL', 'CHOP'
     """
     if vix and vix >= 30:
@@ -273,17 +296,23 @@ def get_regime(vix, bars, vwap=None):
     else:
         base_regime = "NORMAL"
 
-    # Chop detection using range AND VWAP crosses
+    # Chop detection using range, VWAP crosses, AND direction changes
     if len(bars) >= 20:
-        recent      = bars[-20:]
-        recent_high = max(b["h"] for b in recent)
-        recent_low  = min(b["l"] for b in recent)
-        range_pts   = recent_high - recent_low
+        recent       = bars[-20:]
+        recent_high  = max(b["h"] for b in recent)
+        recent_low   = min(b["l"] for b in recent)
+        range_pts    = recent_high - recent_low
         vwap_crosses = count_vwap_crosses(recent, vwap) if vwap else 0
+        dir_changes  = count_direction_changes(recent)
 
+        # Tight range + lots of VWAP crosses = chop
         if range_pts < 12 and vwap_crosses >= 4:
             return "CHOP"
+        # Extremely tight range = chop
         if range_pts < 7:
+            return "CHOP"
+        # Wide range but constant reversals = chop (catches wide choppy days)
+        if dir_changes >= 8:
             return "CHOP"
 
     return base_regime
@@ -361,6 +390,13 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
         for k, v in key_levels.items() if k != "VWAP"
     )
 
+    # VWAP distance — flag if price is too extended for breakout signals
+    vwap_distance = abs(spot - vwap) if vwap else 0
+    too_extended  = vwap_distance > 25  # suppress breakout/momentum signals >25pts from VWAP
+
+    # Compression boost — pre-move setup gets +2 to final score
+    is_compressed = compression_detected(bars)
+
     signals = []
 
     # 1. VWAP RECLAIM
@@ -391,12 +427,14 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
             btype, dtype = "level_breakout", "level_breakout"
 
         if near and prev <= level < spot and momentum > MOMENTUM_MIN_MOVE:
-            signals.append({"trigger": f"Breakout above {name} ({level:,.0f})", "bias": "BULL",
-                            "weight": score_signal(btype), "trigger_type": btype})
+            if not too_extended:  # suppress breakouts far from VWAP
+                signals.append({"trigger": f"Breakout above {name} ({level:,.0f})", "bias": "BULL",
+                                "weight": score_signal(btype), "trigger_type": btype})
 
         if near and prev >= level > spot and momentum < -MOMENTUM_MIN_MOVE:
-            signals.append({"trigger": f"Breakdown below {name} ({level:,.0f})", "bias": "BEAR",
-                            "weight": score_signal(dtype), "trigger_type": dtype})
+            if not too_extended:  # suppress breakdowns far from VWAP
+                signals.append({"trigger": f"Breakdown below {name} ({level:,.0f})", "bias": "BEAR",
+                                "weight": score_signal(dtype), "trigger_type": dtype})
 
         if near and spot < level and bars_confirming(bars, "BEAR", n=2) and momentum < -MOMENTUM_MIN_MOVE:
             signals.append({"trigger": f"Rejection at {name} ({level:,.0f})", "bias": "BEAR",
@@ -406,10 +444,10 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
             signals.append({"trigger": f"Support hold at {name} ({level:,.0f})", "bias": "BULL",
                             "weight": score_signal("level_support"), "trigger_type": "level_support"})
 
-    # 4. MOMENTUM SURGE
+    # 4. MOMENTUM SURGE — suppress if too extended from VWAP
     if abs(momentum) > MOMENTUM_MIN_MOVE * 2 and expanding_range(bars, n=3):
         bias = "BULL" if momentum > 0 else "BEAR"
-        if bars_confirming(bars, bias, n=3):
+        if bars_confirming(bars, bias, n=3) and not too_extended:
             signals.append({"trigger": f"Momentum surge ({momentum:+.1f} pts)", "bias": bias,
                             "weight": score_signal("momentum_surge"), "trigger_type": "momentum_surge"})
 
@@ -428,7 +466,12 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     else:
         return None
 
-    print(f"  → Score: BULL={bull_score} BEAR={bear_score} min={min_score} regime={regime} session={session}")
+    # Compression boost — add +2 if price was compressed before this move
+    if is_compressed:
+        dominant_score += 2
+        print(f"  → Compression boost applied (+2)")
+
+    print(f"  → Score: BULL={bull_score} BEAR={bear_score} final={dominant_score} min={min_score} regime={regime} session={session} extended={too_extended}")
 
     if dominant_score < min_score:
         print(f"  → Blocked: score {dominant_score} < {min_score}")
