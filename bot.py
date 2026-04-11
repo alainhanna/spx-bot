@@ -249,6 +249,32 @@ def check_event_blackout(events, window_before=30, window_after=1):
     return False, None, None, None
 
 # ─────────────────────────────────────────
+# REGIME FILTER
+# ─────────────────────────────────────────
+def get_regime(vix, bars):
+    """
+    Classify current market regime.
+    Returns: 'HIGH_VOL', 'ELEVATED', 'NORMAL', 'CHOP'
+    """
+    regime = "NORMAL"
+
+    # VIX-based regime
+    if vix:
+        if vix >= 30:
+            regime = "HIGH_VOL"
+        elif vix >= 20:
+            regime = "ELEVATED"
+
+    # Chop detection — if day range < 10 pts in first 30 bars, it's choppy
+    if len(bars) >= 30:
+        recent_high = max(b["h"] for b in bars[-30:])
+        recent_low  = min(b["l"] for b in bars[-30:])
+        if recent_high - recent_low < 10:
+            regime = "CHOP"
+
+    return regime
+
+# ─────────────────────────────────────────
 # SIGNAL ENGINE — VWAP + LEVELS + MOMENTUM
 # ─────────────────────────────────────────
 def evaluate_signal(bars, vwap, key_levels, vix=None):
@@ -259,6 +285,12 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     3. Key level breakout (break above/below with momentum)
     4. Momentum surge (3 bars same direction, expanding range)
 
+    Quality scoring:
+    - STRONG: 2+ triggers agree on same direction → fires always
+    - HIGH: single strong trigger → fires in NORMAL/ELEVATED/HIGH_VOL regimes
+    - MEDIUM: weak single trigger → only fires in HIGH_VOL (big moves)
+    - CHOP regime: only STRONG signals fire
+
     Returns signal dict or None.
     """
     if len(bars) < 10 or not vwap:
@@ -267,6 +299,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     spot     = bars[-1]["c"]
     prev     = bars[-2]["c"]
     momentum = calc_momentum(bars, MOMENTUM_BARS)
+    regime   = get_regime(vix, bars)
 
     signals = []
 
@@ -288,7 +321,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
 
     # ── 3. KEY LEVEL REACTION ────────────────────────────────────
     for name, level in key_levels.items():
-        if level is None:
+        if level is None or name == "VWAP":
             continue
         near = abs(spot - level) <= LEVEL_PROXIMITY
 
@@ -308,7 +341,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
                 "strength": "HIGH"
             })
 
-        # Rejection at level (price approached from below, turned back down)
+        # Rejection at level
         if near and spot < level and bars_confirming(bars, "BEAR", n=2) and momentum < -MOMENTUM_MIN_MOVE:
             signals.append({
                 "trigger": f"Rejection at {name} ({level:,.0f})",
@@ -316,7 +349,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
                 "strength": "MEDIUM"
             })
 
-        # Support hold at level (price approached from above, bounced)
+        # Support hold at level
         if near and spot > level and bars_confirming(bars, "BULL", n=2) and momentum > MOMENTUM_MIN_MOVE:
             signals.append({
                 "trigger": f"Support hold at {name} ({level:,.0f})",
@@ -337,23 +370,72 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
     if not signals:
         return None
 
-    # Pick strongest signal — prefer HIGH strength, then first in list
-    best = next((s for s in signals if s["strength"] == "HIGH"), signals[0])
+    # ── QUALITY SCORING ──────────────────────────────────────────
+    # Count signals by direction
+    bull_signals = [s for s in signals if s["bias"] == "BULL"]
+    bear_signals = [s for s in signals if s["bias"] == "BEAR"]
 
-    # Strike calculation
-    strike_offset = spot * 0.002
-    if best["bias"] == "BULL":
-        strike     = round((spot + strike_offset) / 5) * 5
-        option_type = "CALL"
-        invalidate = round(vwap - 5, 2)
+    # Pick dominant direction
+    if len(bull_signals) > len(bear_signals):
+        dominant = bull_signals
+    elif len(bear_signals) > len(bull_signals):
+        dominant = bear_signals
     else:
-        strike     = round((spot - strike_offset) / 5) * 5
+        # Tie — pick whichever has a HIGH strength signal
+        dominant = bull_signals if any(s["strength"] == "HIGH" for s in bull_signals) else bear_signals
+
+    # Score the dominant signals
+    high_count   = sum(1 for s in dominant if s["strength"] == "HIGH")
+    medium_count = sum(1 for s in dominant if s["strength"] == "MEDIUM")
+
+    if len(dominant) >= 2 and high_count >= 1:
+        quality = "STRONG"   # Multiple triggers agree
+    elif high_count >= 1:
+        quality = "HIGH"     # Single strong trigger
+    else:
+        quality = "MEDIUM"   # Only weak triggers
+
+    # ── REGIME GATE ──────────────────────────────────────────────
+    # In CHOP: only STRONG signals fire
+    # In HIGH_VOL: all signals fire (big moves, big opportunities)
+    # In NORMAL/ELEVATED: HIGH and STRONG fire
+    if regime == "CHOP" and quality != "STRONG":
+        print(f"  → Blocked by CHOP regime (quality={quality})")
+        return None
+    if regime == "NORMAL" and quality == "MEDIUM":
+        print(f"  → Blocked by NORMAL regime (quality=MEDIUM)")
+        return None
+
+    # Pick best signal from dominant direction
+    best = next((s for s in dominant if s["strength"] == "HIGH"), dominant[0])
+
+    # ── STRIKE & EXIT LEVELS ─────────────────────────────────────
+    now_et       = datetime.datetime.now(ET)
+    strike_offset = spot * 0.002
+
+    if best["bias"] == "BULL":
+        option_type = "CALL"
+        strike      = round((spot + strike_offset) / 5) * 5
+        invalidate  = round(vwap - 5, 2)
+        target_1    = round(spot + abs(momentum) * 1.5, 2)
+        target_2    = round(spot + abs(momentum) * 3.0, 2)
+        no_chase    = round(spot + 3, 2)  # don't chase if SPX already ran 3pts
+    else:
         option_type = "PUT"
-        invalidate = round(vwap + 5, 2)
+        strike      = round((spot - strike_offset) / 5) * 5
+        invalidate  = round(vwap + 5, 2)
+        target_1    = round(spot - abs(momentum) * 1.5, 2)
+        target_2    = round(spot - abs(momentum) * 3.0, 2)
+        no_chase    = round(spot - 3, 2)
+
+    # Time stop — exit by 3:45 ET no matter what
+    time_stop = "3:45 PM ET"
 
     return {
         "trigger":     best["trigger"],
         "strength":    best["strength"],
+        "quality":     quality,
+        "regime":      regime,
         "bias":        best["bias"],
         "option_type": option_type,
         "spot":        round(spot, 2),
@@ -361,8 +443,13 @@ def evaluate_signal(bars, vwap, key_levels, vix=None):
         "vwap":        vwap,
         "momentum":    momentum,
         "invalidate":  invalidate,
+        "target_1":    target_1,
+        "target_2":    target_2,
+        "no_chase":    no_chase,
+        "time_stop":   time_stop,
         "vix":         vix,
-        "all_signals": [s["trigger"] for s in signals],
+        "regime":      regime,
+        "all_signals": [s["trigger"] for s in dominant],
     }
 
 # ─────────────────────────────────────────
@@ -386,21 +473,44 @@ def send_telegram(message):
 def format_signal_message(sig, alert_count):
     t      = datetime.datetime.now(ET).strftime("%I:%M %p ET")
     emoji  = "🟢" if sig["bias"] == "BULL" else "🔴"
-    star   = "⭐" if sig["strength"] == "HIGH" else ""
     vix_str = f"{sig['vix']:.1f}" if sig.get("vix") else "N/A"
 
-    msg = f"""*SPX 0DTE SIGNAL {emoji} {sig['option_type']} {star}*
+    # Quality badge
+    if sig["quality"] == "STRONG":
+        badge = "⭐⭐ STRONG"
+    elif sig["strength"] == "HIGH":
+        badge = "⭐ HIGH"
+    else:
+        badge = "MEDIUM"
+
+    # Regime label
+    regime_labels = {
+        "HIGH_VOL":  "🔥 High Volatility",
+        "ELEVATED":  "⚡ Elevated Vol",
+        "NORMAL":    "✅ Normal",
+        "CHOP":      "〰️ Choppy"
+    }
+    regime_str = regime_labels.get(sig["regime"], sig["regime"])
+
+    msg = f"""*SPX 0DTE SIGNAL {emoji} {sig['option_type']}*
 ━━━━━━━━━━━━━━━━━━━━━━
+*Quality:*  {badge}
+*Regime:*   {regime_str}
 *Trigger:*  {sig['trigger']}
 *Time:*     {t}
+━━━━━━━━━━━━━━━━━━━━━━
 *Spot:*     {sig['spot']:,.2f}
 *Strike:*   {sig['strike']} {sig['option_type']} 0DTE
 *VWAP:*     {sig['vwap']:,.2f}
 *Momentum:* {sig['momentum']:+.1f} pts
 *VIX:*      {vix_str}
-*Invalidate if:* SPX < {sig['invalidate']:,.2f}
 ━━━━━━━━━━━━━━━━━━━━━━
-*Target:* +{PROFIT_TARGET_PCT}% | *Stop:* -{STOP_LOSS_PCT}%
+*Target 1:* {sig['target_1']:,.2f} SPX (+{PROFIT_TARGET_PCT}% premium)
+*Target 2:* {sig['target_2']:,.2f} SPX (+75% premium)
+*Stop:*     -{STOP_LOSS_PCT}% premium | SPX {sig['invalidate']:,.2f}
+*No chase:* if SPX past {sig['no_chase']:,.2f}
+*Time stop:* Exit by {sig['time_stop']}
+━━━━━━━━━━━━━━━━━━━━━━
 Alert {alert_count}/{MAX_ALERTS_PER_DAY}"""
 
     if len(sig["all_signals"]) > 1:
