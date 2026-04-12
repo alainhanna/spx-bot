@@ -115,16 +115,14 @@ def get_spx_bars_yfinance(limit=60):
 
 def get_spx_bars(limit=60):
     """
-    Fetch SPX bars from Polygon only — rolling 90-minute window for efficiency.
+    Fetch SPX bars from Polygon only — today only, sort desc, limit to recent bars.
     yfinance is NOT used as fallback for signal bars.
     Returns empty list on failure — main loop handles gracefully.
     """
-    end   = datetime.datetime.utcnow()
-    start = end - datetime.timedelta(minutes=90)
+    today = datetime.date.today().isoformat()
     url = (
-        f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/"
-        f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z/{end.strftime('%Y-%m-%dT%H:%M:%S')}Z"
-        f"?adjusted=true&sort=asc&limit={limit}&apiKey={POLYGON_API_KEY}"
+        f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/{today}/{today}"
+        f"?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
     )
     for attempt in range(3):
         try:
@@ -138,7 +136,7 @@ def get_spx_bars(limit=60):
                 raise Exception(f"HTTP {r.status_code}")
             data = r.json()
             if data.get("results"):
-                return data["results"]  # already asc sorted
+                return list(reversed(data["results"]))  # desc → reverse to asc
         except Exception as e:
             if attempt < 2:
                 print(f"[WARN] Polygon bars attempt {attempt+1} failed ({e}), retrying...")
