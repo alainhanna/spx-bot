@@ -5,6 +5,7 @@ import pytz
 import os
 import threading
 import queue
+import csv
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
@@ -766,7 +767,6 @@ SIGNAL_LOG_FIELDS = [
 def log_signal(sig):
     """Append fired signal to CSV log. Creates header if file doesn't exist."""
     try:
-        import os
         write_header = not os.path.exists(SIGNAL_LOG_FILE)
         with open(SIGNAL_LOG_FILE, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=SIGNAL_LOG_FIELDS)
