@@ -48,6 +48,11 @@ VWAP_MAX_EXTENSION   = 50   # SPX points — suppress ALL signals beyond this
 VWAP_BREAK_EXTENSION = 25   # SPX points — suppress breakout/momentum only
 MAX_SIGNAL_SCORE     = 18   # score cap to prevent runaway scoring
 
+# Optional gamma levels — set to None until GEX data source is available
+# When populated, these are treated as additional key levels in evaluate_signal
+# Example: GEX_LEVELS = {"CallWall": 5200, "ZeroGamma": 5150, "PutWall": 5100}
+GEX_LEVELS = None
+
 ET = pytz.timezone("America/New_York")
 
 # ─────────────────────────────────────────
@@ -755,7 +760,6 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
 # ─────────────────────────────────────────
 # SIGNAL LOGGING
 # ─────────────────────────────────────────
-import csv
 
 SIGNAL_LOG_FILE = "signal_log.csv"
 SIGNAL_LOG_FIELDS = [
@@ -998,6 +1002,12 @@ def main():
                 pmh, pml = get_premarket_levels(bars_pm)
                 if pmh: key_levels["PM High"] = pmh
                 if pml: key_levels["PM Low"]  = pml
+
+            # Inject optional GEX levels as key levels if configured
+            if GEX_LEVELS:
+                for name, level in GEX_LEVELS.items():
+                    if level is not None:
+                        key_levels[f"GEX {name}"] = level
 
             msg = format_premarket_message(vix, key_levels, today_events)
             send_telegram(msg)
