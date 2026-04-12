@@ -1118,9 +1118,9 @@ def main():
                 continue
 
             # ── Telegram thread health check ──────────────────────
+            global _telegram_thread
             if not _telegram_thread.is_alive():
                 print("[WARN] Telegram worker thread died — restarting...")
-                global _telegram_thread
                 _telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
                 _telegram_thread.start()
 
