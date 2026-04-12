@@ -4,6 +4,7 @@ import datetime
 import pytz
 import os
 import threading
+import queue
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
@@ -107,6 +108,12 @@ def get_spx_bars_yfinance(limit=60):
         return []
 
 def get_spx_bars(limit=60):
+    """
+    Fetch SPX bars from Polygon only.
+    yfinance is NOT used as fallback for signal bars — data structure differences
+    can corrupt VWAP, ATR, and momentum calculations.
+    Returns empty list on failure — main loop handles gracefully.
+    """
     today = datetime.date.today().isoformat()
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/{today}/{today}"
@@ -115,6 +122,11 @@ def get_spx_bars(limit=60):
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=10)
+            if r.status_code == 429:
+                wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                print(f"[WARN] Polygon rate limit (429) — backing off {wait}s")
+                time.sleep(wait)
+                continue
             if r.status_code != 200:
                 raise Exception(f"HTTP {r.status_code}")
             data = r.json()
@@ -123,11 +135,10 @@ def get_spx_bars(limit=60):
         except Exception as e:
             if attempt < 2:
                 print(f"[WARN] Polygon bars attempt {attempt+1} failed ({e}), retrying...")
-                time.sleep(2)
+                time.sleep(2 ** (attempt + 1))  # exponential backoff on all errors
             else:
-                print("[WARN] Polygon failed — switching to yfinance")
-                return get_spx_bars_yfinance(limit)
-    return get_spx_bars_yfinance(limit)
+                print(f"[WARN] Polygon bars failed after 3 attempts — skipping this cycle")
+    return []  # safe empty return — scan loop will skip signal evaluation
 
 # VIX cache — avoid fetching more than once per minute
 _vix_cache = {"value": None, "ts": None}
@@ -148,7 +159,7 @@ def get_vix():
                 return val
         except Exception as e:
             if attempt < 2:
-                time.sleep(2)
+                time.sleep(2 ** (attempt + 1))  # exponential backoff
             else:
                 print(f"[WARN] VIX unavailable: {e}")
     return _vix_cache["value"]  # return last cached value if fetch fails
@@ -731,20 +742,44 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
 # ─────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────
-def send_telegram(message):
+# ─────────────────────────────────────────
+# ASYNC TELEGRAM QUEUE
+# ─────────────────────────────────────────
+_telegram_queue = queue.Queue(maxsize=100)
+
+def _telegram_worker():
+    """Background thread — drains the Telegram queue without blocking the main loop."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    while True:
+        message = _telegram_queue.get()
+        if message is None:
+            break  # sentinel — graceful shutdown
+        try:
+            r = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown"
+            }, timeout=10)
+            if r.status_code == 200:
+                print(f"[TELEGRAM SENT]")
+            else:
+                print(f"[TELEGRAM ERROR] {r.status_code}: {r.text}")
+        except Exception as e:
+            print(f"[TELEGRAM ERROR] {e}")
+        finally:
+            _telegram_queue.task_done()
+
+# Start background Telegram worker thread (daemon — dies with main process)
+_telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
+_telegram_thread.start()
+
+def send_telegram(message):
+    """Non-blocking — enqueues message for background delivery.
+    Drops message if queue is full (extended outage) to prevent memory exhaustion."""
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }, timeout=10)
-        if r.status_code == 200:
-            print(f"[TELEGRAM SENT]")
-        else:
-            print(f"[TELEGRAM ERROR] {r.status_code}: {r.text}")
-    except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
+        _telegram_queue.put_nowait(message)
+    except queue.Full:
+        print(f"[TELEGRAM] Queue full — message dropped: {message[:50]}")
 
 def format_signal_message(sig, alert_count):
     t      = datetime.datetime.now(ET).strftime("%I:%M %p ET")
@@ -1004,6 +1039,12 @@ def main():
                 send_telegram(f"💓 *Bot Heartbeat* — {now_et.strftime('%I:%M %p ET')}\nSPX={spot:,.2f} | VWAP={vwap} | VIX={vix_str}\nAlerts today: {alert_count}/{MAX_ALERTS_PER_DAY}")
                 print(f"  → Heartbeat sent")
 
+            # ── Telegram thread health check ──────────────────────
+            if not _telegram_thread.is_alive():
+                print("[WARN] Telegram worker thread died — restarting...")
+                new_thread = threading.Thread(target=_telegram_worker, daemon=True)
+                new_thread.start()
+
             # ── Signal evaluation ─────────────────────────────────
             cooldown_ok = True
             if last_signal_time:
@@ -1062,4 +1103,10 @@ if __name__ == "__main__":
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     print(f"[HEALTH] Health check server started on port {os.environ.get('PORT', 8080)}")
-    main()
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print(f"[CRITICAL] main() crashed: {e} — restarting in 30s")
+            send_telegram(f"⚠️ *Bot Crashed*\nError: {str(e)[:100]}\nRestarting in 30 seconds...")
+            time.sleep(30)
