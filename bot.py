@@ -417,7 +417,7 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
     # Failed breakout / trend reset — price rotated back inside OR near VWAP
     # Override any trend classification if this condition is met
     buffer    = 2
-    inside_or = (or_low + buffer) < last_close < (or_high - buffer) if (or_high and or_low) else False
+    inside_or = (or_low + buffer) < last_close < (or_high - buffer) if (or_high is not None and or_low is not None) else False
     if inside_or and vwap_crosses >= 2 and abs(last_close - last_vwap) < 5:
         print(f"  → Trend reset: price back inside OR, {vwap_crosses} VWAP crosses, {abs(last_close - last_vwap):.1f}pts from VWAP")
         return "NONE"
@@ -1042,8 +1042,9 @@ def main():
             # ── Telegram thread health check ──────────────────────
             if not _telegram_thread.is_alive():
                 print("[WARN] Telegram worker thread died — restarting...")
-                new_thread = threading.Thread(target=_telegram_worker, daemon=True)
-                new_thread.start()
+                global _telegram_thread
+                _telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
+                _telegram_thread.start()
 
             # ── Signal evaluation ─────────────────────────────────
             cooldown_ok = True
