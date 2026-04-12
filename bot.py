@@ -109,21 +109,22 @@ def get_spx_bars_yfinance(limit=60):
 
 def get_spx_bars(limit=60):
     """
-    Fetch SPX bars from Polygon only.
-    yfinance is NOT used as fallback for signal bars — data structure differences
-    can corrupt VWAP, ATR, and momentum calculations.
+    Fetch SPX bars from Polygon only — rolling 90-minute window for efficiency.
+    yfinance is NOT used as fallback for signal bars.
     Returns empty list on failure — main loop handles gracefully.
     """
-    today = datetime.date.today().isoformat()
+    end   = datetime.datetime.utcnow()
+    start = end - datetime.timedelta(minutes=90)
     url = (
-        f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/{today}/{today}"
-        f"?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
+        f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/"
+        f"{start.strftime('%Y-%m-%dT%H:%M:%S')}Z/{end.strftime('%Y-%m-%dT%H:%M:%S')}Z"
+        f"?adjusted=true&sort=asc&limit={limit}&apiKey={POLYGON_API_KEY}"
     )
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 429:
-                wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                wait = 2 ** (attempt + 1)
                 print(f"[WARN] Polygon rate limit (429) — backing off {wait}s")
                 time.sleep(wait)
                 continue
@@ -131,14 +132,14 @@ def get_spx_bars(limit=60):
                 raise Exception(f"HTTP {r.status_code}")
             data = r.json()
             if data.get("results"):
-                return list(reversed(data["results"]))
+                return data["results"]  # already asc sorted
         except Exception as e:
             if attempt < 2:
                 print(f"[WARN] Polygon bars attempt {attempt+1} failed ({e}), retrying...")
-                time.sleep(2 ** (attempt + 1))  # exponential backoff on all errors
+                time.sleep(2 ** (attempt + 1))
             else:
-                print(f"[WARN] Polygon bars failed after 3 attempts — skipping this cycle")
-    return []  # safe empty return — scan loop will skip signal evaluation
+                print(f"[WARN] Polygon bars failed after 3 attempts — skipping cycle")
+    return []
 
 # VIX cache — avoid fetching more than once per minute
 _vix_cache = {"value": None, "ts": None}
@@ -149,8 +150,14 @@ def get_vix():
         return _vix_cache["value"]
     for attempt in range(3):
         try:
-            url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/range/1/day/2020-01-01/{datetime.date.today().isoformat()}?adjusted=true&sort=desc&limit=1&apiKey={POLYGON_API_KEY}"
+            # Use /prev for lightweight latest VIX value
+            url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev?apiKey={POLYGON_API_KEY}"
             r = requests.get(url, timeout=10)
+            if r.status_code == 429:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            if r.status_code != 200:
+                raise Exception(f"HTTP {r.status_code}")
             data = r.json()
             if data.get("results"):
                 val = float(data["results"][0]["c"])
@@ -159,7 +166,7 @@ def get_vix():
                 return val
         except Exception as e:
             if attempt < 2:
-                time.sleep(2 ** (attempt + 1))  # exponential backoff
+                time.sleep(2 ** (attempt + 1))
             else:
                 print(f"[WARN] VIX unavailable: {e}")
     return _vix_cache["value"]  # return last cached value if fetch fails
@@ -432,21 +439,23 @@ def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
 
     return "NONE"
 
-def detect_trend_acceleration(bars):
+def detect_trend_acceleration(bars, trend_day="NONE"):
     """
     Detects when a confirmed trend day transitions into a runaway move.
-    Characteristics: 4-5 consecutive directional candles, expanding ranges,
-    momentum rapidly increasing, price separating from VWAP.
+    Directional — only confirms acceleration aligned with trend_day direction.
     Only meaningful when trend_day is already confirmed.
     """
-    if len(bars) < 5:
+    if len(bars) < 5 or trend_day == "NONE":
         return False
     last5    = bars[-5:]
     momentum = last5[-1]["c"] - last5[0]["c"]
     ranges   = [b["h"] - b["l"] for b in last5]
-    expanding   = ranges[-1] > ranges[0]
-    strong_move = abs(momentum) > 8
-    return strong_move and expanding
+    expanding = ranges[-1] > ranges[0]
+    if trend_day == "BULL_TREND":
+        return momentum > 8 and expanding
+    elif trend_day == "BEAR_TREND":
+        return momentum < -8 and expanding
+    return False
 
 # ─────────────────────────────────────────
 # WEIGHTED SIGNAL SCORING
@@ -527,7 +536,7 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
     accelerating   = False
     if trend_day == "BULL_TREND" or trend_day == "BEAR_TREND":
         vwap_break_ext = 35  # allow continuation further from VWAP on trend days
-        accelerating   = detect_trend_acceleration(bars)
+        accelerating   = detect_trend_acceleration(bars, trend_day)
         if accelerating:
             vwap_break_ext = 45  # runaway move — wider extension allowed
             print(f"  → TREND ACCELERATION detected: extension widened to {vwap_break_ext}pts")
@@ -743,6 +752,48 @@ def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
 # TELEGRAM
 # ─────────────────────────────────────────
 # ─────────────────────────────────────────
+# SIGNAL LOGGING
+# ─────────────────────────────────────────
+import csv
+
+SIGNAL_LOG_FILE = "signal_log.csv"
+SIGNAL_LOG_FIELDS = [
+    "timestamp", "trigger", "score", "quality", "regime", "session",
+    "trend_day", "bias", "spot", "vwap", "momentum", "vwap_distance",
+    "target_1", "target_2", "invalidate", "no_chase"
+]
+
+def log_signal(sig):
+    """Append fired signal to CSV log. Creates header if file doesn't exist."""
+    try:
+        import os
+        write_header = not os.path.exists(SIGNAL_LOG_FILE)
+        with open(SIGNAL_LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SIGNAL_LOG_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp":    datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+                "trigger":      sig.get("trigger", ""),
+                "score":        sig.get("score", ""),
+                "quality":      sig.get("quality", ""),
+                "regime":       sig.get("regime", ""),
+                "session":      sig.get("session", ""),
+                "trend_day":    sig.get("trend_day", "NONE"),
+                "bias":         sig.get("bias", ""),
+                "spot":         sig.get("spot", ""),
+                "vwap":         sig.get("vwap", ""),
+                "momentum":     sig.get("momentum", ""),
+                "vwap_distance": round(abs(sig.get("spot", 0) - sig.get("vwap", 0)), 2) if sig.get("vwap") else "",
+                "target_1":     sig.get("target_1", ""),
+                "target_2":     sig.get("target_2", ""),
+                "invalidate":   sig.get("invalidate", ""),
+                "no_chase":     sig.get("no_chase", ""),
+            })
+    except Exception as e:
+        print(f"[WARN] Signal log failed: {e}")
+
+# ─────────────────────────────────────────
 # ASYNC TELEGRAM QUEUE
 # ─────────────────────────────────────────
 _telegram_queue = queue.Queue(maxsize=100)
@@ -893,6 +944,7 @@ def main():
     last_vwap_signal_time  = None
     vwap_history           = []
     trend_day              = "NONE"
+    last_vwap_bar_time     = None
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -917,6 +969,7 @@ def main():
             last_vwap_signal_time  = None
             vwap_history           = []
             trend_day              = "NONE"
+            last_vwap_bar_time     = None
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
 
         # ── Pre-market brief ─────────────────────────────────────
@@ -977,12 +1030,17 @@ def main():
             vwap     = calc_vwap(bars)
             momentum = calc_momentum(bars, MOMENTUM_BARS)
 
-            # Update VWAP in key levels and history
-            if vwap:
-                key_levels["VWAP"] = vwap
-                vwap_history.append(vwap)
-                if len(vwap_history) > 60:  # keep last 60 readings
-                    vwap_history.pop(0)
+            # Update VWAP in key levels and history — only on new minute bar
+            if vwap and bars[-1].get("t"):
+                current_bar_time = bars[-1]["t"]
+                if current_bar_time != last_vwap_bar_time:
+                    last_vwap_bar_time = current_bar_time
+                    key_levels["VWAP"] = vwap
+                    vwap_history.append(vwap)
+                    if len(vwap_history) > 60:
+                        vwap_history.pop(0)
+            elif vwap:
+                key_levels["VWAP"] = vwap  # always keep key_levels current
 
             vix_str = f"{vix:.1f}" if vix else "N/A"
             print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={vwap} VIX={vix_str} Mom={momentum:+.1f} OR={or_high}/{or_low} Alerts={alert_count}/{MAX_ALERTS_PER_DAY}")
@@ -1039,6 +1097,26 @@ def main():
                 send_telegram(f"💓 *Bot Heartbeat* — {now_et.strftime('%I:%M %p ET')}\nSPX={spot:,.2f} | VWAP={vwap} | VIX={vix_str}\nAlerts today: {alert_count}/{MAX_ALERTS_PER_DAY}")
                 print(f"  → Heartbeat sent")
 
+            # ── Bar continuity guard ─────────────────────────────
+            bars_ok = True
+            if len(bars) >= 2:
+                for i in range(len(bars)-1, max(len(bars)-6, 0), -1):
+                    if bars[i].get("t") and bars[i-1].get("t"):
+                        gap = (bars[i]["t"] - bars[i-1]["t"]) / 1000  # ms to seconds
+                        if gap > 90:  # more than 90s = gap in data
+                            print(f"[{now_et.strftime('%H:%M ET')}] Bar gap detected ({gap:.0f}s) — skipping cycle")
+                            bars_ok = False
+                            break
+            if not bars_ok:
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── Warm-up guard — require minimum state before signaling ──
+            if len(vwap_history) < 10:
+                print(f"[{now_et.strftime('%H:%M ET')}] Warming up ({len(vwap_history)}/10 VWAP readings)...")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
             # ── Telegram thread health check ──────────────────────
             if not _telegram_thread.is_alive():
                 print("[WARN] Telegram worker thread died — restarting...")
@@ -1071,6 +1149,7 @@ def main():
                         last_vwap_signal_time = now_et
                     msg = format_signal_message(sig, alert_count)
                     send_telegram(msg)
+                    log_signal(sig)
                     print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['quality']} (score={sig['score']})")
                 else:
                     print(f"  → No signal | VWAP={vwap} Mom={momentum:+.1f}")
