@@ -916,6 +916,56 @@ Signals: VWAP reclaim/rejection + key level reactions + momentum surges
 Blackout: 30min before / 1min after events"""
 
 # ─────────────────────────────────────────
+# TELEGRAM COMMAND POLLING
+# ─────────────────────────────────────────
+_last_update_id = None
+
+def poll_telegram_commands(key_levels, today_events):
+    """
+    Poll Telegram for new commands and handle them.
+    Supported: /brief — sends a fresh pre-market brief on demand.
+    """
+    global _last_update_id
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        params = {"timeout": 0, "limit": 10}
+        if _last_update_id is not None:
+            params["offset"] = _last_update_id + 1
+
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return
+        updates = r.json().get("result", [])
+        for update in updates:
+            _last_update_id = update["update_id"]
+            msg = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            if text == "/brief":
+                print("[COMMAND] /brief received — building on-demand brief...")
+                vix = get_vix()
+                events = today_events if today_events else get_economic_events()
+                levels = key_levels if key_levels else {}
+                prev = get_prev_day_levels()
+                if prev and not levels:
+                    levels = {
+                        "Prev Day High":  prev["pdh"],
+                        "Prev Day Low":   prev["pdl"],
+                        "Prev Day Close": prev["pdc"],
+                    }
+                brief = format_premarket_message(vix, levels, events)
+                send_telegram(brief)
+                print("[COMMAND] /brief sent.")
+            elif text == "/status":
+                now_str = datetime.datetime.now(ET).strftime("%I:%M %p ET")
+                vix = get_vix()
+                vix_str = f"{vix:.1f}" if vix else "N/A"
+                status = f"✅ *Bot Status*\nTime: {now_str}\nVIX: {vix_str}\nMarket open: {'Yes' if is_market_open() else 'No'}"
+                send_telegram(status)
+                print("[COMMAND] /status sent.")
+    except Exception as e:
+        print(f"[WARN] Command poll error: {e}")
+
+# ─────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────
 def main():
@@ -951,6 +1001,9 @@ def main():
     while True:
         now_et = datetime.datetime.now(ET)
         today  = now_et.date()
+
+        # ── Telegram command polling ─────────────────────────────
+        poll_telegram_commands(key_levels, today_events)
 
         # ── Daily reset ──────────────────────────────────────────
         if last_date != today:
