@@ -8,6 +8,15 @@ import queue
 import csv
 from flask import Flask
 
+# Daily levels context (optional — bot runs normally if file missing)
+try:
+    from daily_levels import get_alert_context
+    _LEVELS_LOADED = True
+    print("[LEVELS] daily_levels.py loaded successfully")
+except ImportError:
+    _LEVELS_LOADED = False
+    print("[LEVELS] daily_levels.py not found — running without level context")
+
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
@@ -698,6 +707,13 @@ def format_signal_message(sig, alert_count, max_alerts):
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Alert {alert_count}/{max_alerts}"
     )
+    # Append daily level context if loaded
+    if _LEVELS_LOADED:
+        try:
+            level_ctx = get_alert_context(sig["spot"])
+            msg += f"\n\n*Market Structure:*\n{level_ctx}"
+        except Exception:
+            pass
     extras = sig.get("all_candidates", [])
     if extras:
         msg += "\n\n*Also triggered:*\n" + "\n".join(f"  + {s}" for s in extras)
@@ -805,6 +821,8 @@ def main():
             vwap_history      = []
             last_bar_time     = None
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day - reset.")
+            if _LEVELS_LOADED:
+                print("[LEVELS] daily_levels.py active — structural context will enrich alerts")
 
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
             print(f"[{now_et.strftime('%H:%M ET')}] Building pre-market brief...")
@@ -812,11 +830,11 @@ def main():
             today_events = get_economic_events()
             prev         = get_prev_day_levels()
             if prev:
-                key_levels = {
+                key_levels.update({
                     "Prev Day High":  prev["pdh"],
                     "Prev Day Low":   prev["pdl"],
                     "Prev Day Close": prev["pdc"],
-                }
+                })
             bars_pm = get_spx_bars(limit=30)
             if bars_pm:
                 spot_pm     = bars_pm[-1]["c"]
