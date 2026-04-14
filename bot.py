@@ -84,7 +84,7 @@ def get_spx_bars(limit=80):
     today = datetime.datetime.now(ET).date().isoformat()
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/{today}/{today}"
-        f"?adjusted=true&sort=asc&limit={limit}&apiKey={POLYGON_API_KEY}"
+        f"?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
     )
     for attempt in range(3):
         try:
@@ -97,7 +97,8 @@ def get_spx_bars(limit=80):
             data    = r.json()
             results = data.get("results", [])
             if results:
-                print(f"[POLYGON] {len(results)} bars fetched")
+                results = list(reversed(results))  # desc → chronological order
+                print(f"[POLYGON] {len(results)} latest bars fetched")
                 return results
             else:
                 print(f"[WARN] Polygon 0 bars — status={data.get('status')}")
@@ -106,7 +107,7 @@ def get_spx_bars(limit=80):
                 print(f"[WARN] Polygon attempt {attempt+1} failed ({e}), retrying...")
                 time.sleep(2 ** (attempt + 1))
             else:
-                print(f"[WARN] Polygon bars failed after 3 attempts")
+                print("[WARN] Polygon bars failed after 3 attempts")
     return []
 
 _vix_cache = {"value": None, "ts": None}
@@ -872,6 +873,13 @@ def main():
             # All signal logic uses completed bars only
             closed_bars = bars[:-1]
             closed_vwap = calc_vwap(closed_bars)
+
+            # Debug: confirm last completed bar is current, not stale
+            if closed_bars:
+                last_bar_dt = datetime.datetime.fromtimestamp(
+                    closed_bars[-1]["t"] / 1000, ET
+                ).strftime("%H:%M ET") if closed_bars[-1].get("t") else "no-ts"
+                print(f"  [BAR] last completed bar: {last_bar_dt} close={closed_bars[-1]['c']:,.2f}")
 
             if new_bar and closed_vwap:
                 vwap_history.append(closed_vwap)
