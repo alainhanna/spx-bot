@@ -6,11 +6,6 @@ import os
 import threading
 import queue
 import csv
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
 from flask import Flask
 
 # ─────────────────────────────────────────
@@ -20,7 +15,6 @@ POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Fail loudly if credentials missing
 if not POLYGON_API_KEY:
     raise ValueError("POLYGON_API_KEY environment variable not set")
 if not TELEGRAM_TOKEN:
@@ -29,29 +23,21 @@ if not TELEGRAM_CHAT_ID:
     raise ValueError("TELEGRAM_CHAT_ID environment variable not set")
 
 POLL_INTERVAL_SEC  = 15
-COOLDOWN_MINUTES   = 1
+COOLDOWN_MINUTES   = 2          # minimum minutes between signals
 MAX_ALERTS_PER_DAY = 20
-PROFIT_TARGET_PCT  = 45
-STOP_LOSS_PCT      = 50
 
-# Key level proximity — how close to a level before we watch for reaction (points)
-LEVEL_PROXIMITY    = 8
+# Breakout engine config — session-aware
+BREAKOUT_CONFIRM_BARS  = 1      # MORNING: 1 bar confirm; MIDDAY/AFTERNOON: 2 bars
+BREAKOUT_MIN_MOMENTUM  = 4.0   # MORNING; MIDDAY=2.5, AFTERNOON=2.0 (applied in engine)
+BREAKOUT_RETEST_WINDOW = 8.0   # points — how close to level counts as retest
+RETEST_LOOKBACK        = 12    # bars to look back for prior breakout confirmation
+PULLBACK_MAX           = 5.0   # points — max pullback allowed on retest entry
+FOLLOW_THROUGH_MIN     = 2.0   # points past level required after break bar
 
-# Momentum: minimum points moved in last N bars to confirm direction
-MOMENTUM_BARS      = 3
-MOMENTUM_MIN_MOVE  = 3.0   # SPX points
-
-# Hardening rules
-MIN_SIGNAL_DISTANCE  = 6    # SPX points — direction-aware price cooldown
-VWAP_FLIP_COOLDOWN   = 5    # minutes — prevents VWAP reclaim/rejection spam
-VWAP_MAX_EXTENSION   = 50   # SPX points — suppress ALL signals beyond this
-VWAP_BREAK_EXTENSION = 25   # SPX points — suppress breakout/momentum only
-MAX_SIGNAL_SCORE     = 18   # score cap to prevent runaway scoring
-
-# Optional gamma levels — set to None until GEX data source is available
-# When populated, these are treated as additional key levels in evaluate_signal
-# Example: GEX_LEVELS = {"CallWall": 5200, "ZeroGamma": 5150, "PutWall": 5100}
-GEX_LEVELS = None
+# Profit targets / stops (option premium %)
+PROFIT_TARGET_1_PCT = 40
+PROFIT_TARGET_2_PCT = 80
+STOP_LOSS_PCT       = 50
 
 ET = pytz.timezone("America/New_York")
 
@@ -70,117 +56,97 @@ def is_premarket():
     now = datetime.datetime.now(ET)
     if now.weekday() >= 5:
         return False
-    s = now.replace(hour=6,  minute=0,  second=0, microsecond=0)
-    e = now.replace(hour=9,  minute=29, second=0, microsecond=0)
+    s = now.replace(hour=6, minute=0,  second=0, microsecond=0)
+    e = now.replace(hour=9, minute=29, second=0, microsecond=0)
     return s <= now <= e
 
-def in_entry_window():
-    now = datetime.datetime.now(ET).time()
-    return datetime.time(9, 30) <= now <= datetime.time(15, 30)
+def get_session(now_et):
+    t = now_et.time()
+    if t < datetime.time(11, 0):
+        return "MORNING"
+    elif t < datetime.time(14, 0):
+        return "MIDDAY"
+    else:
+        return "AFTERNOON"
 
 # ─────────────────────────────────────────
 # DATA FETCHING
 # ─────────────────────────────────────────
-def get_spx_bars_yfinance(limit=60):
-    if not YFINANCE_AVAILABLE:
-        return []
-    try:
-        spx = yf.download("^GSPC", period="2d", interval="1m", progress=False)
-        if spx.empty:
-            return []
-        # Filter to today only
-        today = datetime.datetime.now(ET).date()
-        spx = spx[spx.index.date == today]
-        spx = spx.tail(limit)
-        bars = []
-        for ts, row in spx.iterrows():
-            def v(x):
-                try:
-                    return float(x.iloc[0]) if hasattr(x, 'iloc') else float(x)
-                except:
-                    return 0.0
-            bars.append({
-                "o": v(row["Open"]),
-                "h": v(row["High"]),
-                "l": v(row["Low"]),
-                "c": v(row["Close"]),
-                "v": v(row["Volume"]),
-            })
-        if bars:
-            print(f"[YFINANCE] {len(bars)} bars fetched as fallback")
-        return bars
-    except Exception as e:
-        print(f"[ERROR] yfinance: {e}")
-        return []
-
-def get_spx_bars(limit=60):
-    """
-    Fetch SPX bars from Polygon only — today only, sort desc, limit to recent bars.
-    yfinance is NOT used as fallback for signal bars.
-    Returns empty list on failure — main loop handles gracefully.
-    """
-    today = datetime.date.today().isoformat()
+def get_spx_bars(limit=80):
+    """Fetch SPX 1-min bars from Polygon. Returns bars sorted oldest→newest."""
+    today = datetime.datetime.now(ET).date().isoformat()
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/minute/{today}/{today}"
-        f"?adjusted=true&sort=desc&limit={limit}&apiKey={POLYGON_API_KEY}"
+        f"?adjusted=true&sort=asc&limit={limit}&apiKey={POLYGON_API_KEY}"
     )
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 429:
-                wait = 2 ** (attempt + 1)
-                print(f"[WARN] Polygon rate limit (429) — backing off {wait}s")
-                time.sleep(wait)
+                time.sleep(2 ** (attempt + 1))
                 continue
             if r.status_code != 200:
                 raise Exception(f"HTTP {r.status_code}")
             data = r.json()
-            if data.get("results"):
-                return list(reversed(data["results"]))  # desc → reverse to asc
+            results = data.get("results", [])
+            if results:
+                print(f"[POLYGON] {len(results)} bars fetched")
+                return results
+            else:
+                print(f"[WARN] Polygon returned 0 bars. resultsCount={data.get('resultsCount')} status={data.get('status')}")
         except Exception as e:
             if attempt < 2:
                 print(f"[WARN] Polygon bars attempt {attempt+1} failed ({e}), retrying...")
                 time.sleep(2 ** (attempt + 1))
             else:
-                print(f"[WARN] Polygon bars failed after 3 attempts — skipping cycle")
+                print(f"[WARN] Polygon bars failed after 3 attempts")
     return []
 
-# VIX cache — avoid fetching more than once per minute
 _vix_cache = {"value": None, "ts": None}
 
 def get_vix():
+    """Fetch live VIX from Polygon snapshot endpoint (not /prev)."""
     now = datetime.datetime.now(ET)
     if _vix_cache["ts"] and (now - _vix_cache["ts"]).total_seconds() < 60:
         return _vix_cache["value"]
     for attempt in range(3):
         try:
-            # Use /prev for lightweight latest VIX value
-            url = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev?apiKey={POLYGON_API_KEY}"
+            # Use snapshot for live value during market hours
+            url = f"https://api.polygon.io/v3/snapshot?ticker.any_of=I:VIX&apiKey={POLYGON_API_KEY}"
             r = requests.get(url, timeout=10)
             if r.status_code == 429:
                 time.sleep(2 ** (attempt + 1))
                 continue
-            if r.status_code != 200:
-                raise Exception(f"HTTP {r.status_code}")
-            data = r.json()
-            if data.get("results"):
-                val = float(data["results"][0]["c"])
-                _vix_cache["value"] = val
-                _vix_cache["ts"]    = now
-                return val
+            if r.status_code == 200:
+                data = r.json()
+                results = data.get("results", [])
+                if results:
+                    val = float(results[0].get("session", {}).get("close") or results[0].get("value", 0))
+                    if val > 0:
+                        _vix_cache["value"] = round(val, 2)
+                        _vix_cache["ts"] = now
+                        return _vix_cache["value"]
+            # Fallback: /prev for last close
+            url2 = f"https://api.polygon.io/v2/aggs/ticker/I:VIX/prev?apiKey={POLYGON_API_KEY}"
+            r2 = requests.get(url2, timeout=10)
+            if r2.status_code == 200:
+                data2 = r2.json()
+                if data2.get("results"):
+                    val = float(data2["results"][0]["c"])
+                    _vix_cache["value"] = round(val, 2)
+                    _vix_cache["ts"] = now
+                    return _vix_cache["value"]
         except Exception as e:
             if attempt < 2:
                 time.sleep(2 ** (attempt + 1))
             else:
                 print(f"[WARN] VIX unavailable: {e}")
-    return _vix_cache["value"]  # return last cached value if fetch fails
+    return _vix_cache["value"]
 
 def get_prev_day_levels():
-    """Get prior day high and low for key levels"""
-    try:
-        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-        # Go back up to 5 days to find last trading day
-        for days_back in range(1, 6):
+    """Get prior trading day OHLC."""
+    for days_back in range(1, 6):
+        try:
             d = (datetime.date.today() - datetime.timedelta(days=days_back)).isoformat()
             url = (
                 f"https://api.polygon.io/v2/aggs/ticker/I:SPX/range/1/day/{d}/{d}"
@@ -190,110 +156,76 @@ def get_prev_day_levels():
             data = r.json()
             if data.get("results"):
                 res = data["results"][0]
-                return {
-                    "pdh": round(res["h"], 2),
-                    "pdl": round(res["l"], 2),
-                    "pdc": round(res["c"], 2),
-                }
-    except Exception as e:
-        print(f"[WARN] prev day levels: {e}")
+                return {"pdh": round(res["h"], 2), "pdl": round(res["l"], 2), "pdc": round(res["c"], 2)}
+        except Exception as e:
+            print(f"[WARN] prev day levels: {e}")
     return None
-
-def get_premarket_levels(bars):
-    """Get premarket high and low from bars before 9:30 ET"""
-    if not bars:
-        return None, None
-    pm_bars = [b for b in bars if b.get("t") and
-               datetime.datetime.fromtimestamp(b["t"]/1000, ET).time() < datetime.time(9, 30)]
-    if not pm_bars:
-        return None, None
-    pmh = max(b["h"] for b in pm_bars)
-    pml = min(b["l"] for b in pm_bars)
-    return round(pmh, 2), round(pml, 2)
 
 # ─────────────────────────────────────────
 # INDICATORS
 # ─────────────────────────────────────────
 def calc_vwap(bars):
-    """Calculate VWAP using RTH bars only (9:30 AM ET onwards)"""
-    try:
-        rth_bars = []
-        for b in bars:
-            if b.get("t"):
-                bar_time = datetime.datetime.fromtimestamp(b["t"]/1000, ET)
-                if bar_time.hour > 9 or (bar_time.hour == 9 and bar_time.minute >= 30):
-                    rth_bars.append(b)
-            else:
-                rth_bars.append(b)  # no timestamp — include by default
-        if not rth_bars:
-            return None
-        tp_vol = sum(((b["h"] + b["l"] + b["c"]) / 3) * b.get("v", 0) for b in rth_bars)
-        vol    = sum(b.get("v", 0) for b in rth_bars)
-        return round(tp_vol / vol, 2) if vol else None
-    except:
+    """
+    VWAP from RTH bars only. Bars must have 't' timestamp in milliseconds.
+    Uses strict ET 9:30 filter.
+    """
+    rth_bars = []
+    for b in bars:
+        t = b.get("t")
+        if t:
+            bar_dt = datetime.datetime.fromtimestamp(t / 1000, ET)
+            if bar_dt.hour > 9 or (bar_dt.hour == 9 and bar_dt.minute >= 30):
+                rth_bars.append(b)
+    if not rth_bars:
+        print(f"[VWAP] No RTH bars found from {len(bars)} total bars")
         return None
+    tp_vol = sum(((b["h"] + b["l"] + b["c"]) / 3) * b.get("v", 1) for b in rth_bars)
+    vol    = sum(b.get("v", 1) for b in rth_bars)
+    vwap   = round(tp_vol / vol, 2) if vol else None
+    print(f"[VWAP] Computed from {len(rth_bars)} RTH bars → {vwap}")
+    return vwap
 
 def calc_momentum(bars, n=3):
-    """Net move over last n bars"""
     if len(bars) < n + 1:
-        return 0
+        return 0.0
     return round(bars[-1]["c"] - bars[-(n+1)]["c"], 2)
 
-def bars_confirming(bars, direction, n=2):
-    """Check if last n bars are green (BULL) or red (BEAR)"""
-    recent = bars[-n:]
-    if direction == "BULL":
-        return all(b["c"] >= b["o"] for b in recent)
-    else:
-        return all(b["c"] <= b["o"] for b in recent)
-
-def expanding_range(bars, n=3):
-    """Check if bar ranges are expanding (accelerating move)"""
-    if len(bars) < n:
-        return False
-    ranges = [b["h"] - b["l"] for b in bars[-n:]]
-    return ranges[-1] > ranges[0]
-
-def calculate_atr(bars, period=14):
-    """Calculate Average True Range over N bars"""
+def calc_atr(bars, period=14):
     if len(bars) < period + 1:
-        return 3.0  # Safe fallback for SPX
-    true_ranges = []
+        return 5.0
+    trs = []
     for i in range(1, len(bars)):
         h, l, pc = bars[i]["h"], bars[i]["l"], bars[i-1]["c"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        true_ranges.append(tr)
-    return round(sum(true_ranges[-period:]) / period, 2)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return round(sum(trs[-period:]) / period, 2)
+
+def get_regime(vix, bars):
+    """Simple regime: VIX-based only. CHOP detected separately per signal."""
+    if vix and vix >= 30:
+        return "HIGH_VOL"
+    elif vix and vix >= 20:
+        return "ELEVATED"
+    return "NORMAL"
 
 # ─────────────────────────────────────────
 # ECONOMIC CALENDAR
 # ─────────────────────────────────────────
-HIGH_IMPACT_KEYWORDS = [
-    "consumer price index", "cpi", "federal reserve", "fomc", "fed rate",
-    "nonfarm payroll", "nfp", "jobs report", "gdp", "pce",
-    "producer price index", "ppi", "unemployment", "jobless claims",
-    "retail sales", "consumer sentiment", "ism"
-]
-
 def get_economic_events():
-    today     = datetime.date.today()
-    today_str = today.isoformat()
-    events    = []
-
-    # Manual events — update each week
+    today  = datetime.date.today()
+    events = []
+    # Add manual events here each week
     MANUAL_EVENTS = [
-        # ("08:30", "CPI — Consumer Price Index"),
+        # ("08:30", "CPI"),
+        # ("14:00", "FOMC"),
     ]
-
     for time_str, name in MANUAL_EVENTS:
         try:
             h, m = map(int, time_str.split(":"))
-            event_dt = ET.localize(datetime.datetime(today.year, today.month, today.day, h, m))
-            events.append({"name": name, "time": event_dt})
+            dt = ET.localize(datetime.datetime(today.year, today.month, today.day, h, m))
+            events.append({"name": name, "time": dt})
         except:
             continue
-
-    print(f"[CALENDAR] {len(events)} high-impact events today: {[e['name'] for e in events]}")
+    print(f"[CALENDAR] {len(events)} events today")
     return events
 
 def check_event_blackout(events, window_before=30, window_after=1):
@@ -308,466 +240,308 @@ def check_event_blackout(events, window_before=30, window_after=1):
     return False, None, None, None
 
 # ─────────────────────────────────────────
-# REGIME FILTER
+# BREAKOUT SIGNAL ENGINE
 # ─────────────────────────────────────────
-def count_vwap_crosses(bars, vwap_history):
-    """Count VWAP crosses using point-in-time history for precise detection."""
-    crosses = 0
-    if not vwap_history or len(vwap_history) < len(bars):
-        return 0
-    hist_v = vwap_history[-len(bars):]
-    for i in range(1, len(bars)):
-        if (bars[i-1]["c"] < hist_v[i-1] and bars[i]["c"] >= hist_v[i]) or            (bars[i-1]["c"] > hist_v[i-1] and bars[i]["c"] <= hist_v[i]):
-            crosses += 1
-    return crosses
-
-def count_direction_changes(bars):
-    """Count bar-to-bar direction reversals — high count = chop even on wide range days"""
-    changes = 0
-    for i in range(2, len(bars)):
-        prev_move = bars[i-1]["c"] - bars[i-2]["c"]
-        curr_move = bars[i]["c"] - bars[i-1]["c"]
-        if prev_move * curr_move < 0:  # opposite signs = reversal
-            changes += 1
-    return changes
-
-def compression_detected(bars):
-    """
-    Detect pre-move compression: recent bars have tighter range than prior bars.
-    Compression -> expansion is a high-quality setup signal.
-    """
-    if len(bars) < 30:
+def bars_above_level(bars, level, n):
+    """Check if last n bars all closed above level."""
+    if len(bars) < n:
         return False
-    recent_ranges = [b["h"] - b["l"] for b in bars[-10:]]
-    prior_ranges  = [b["h"] - b["l"] for b in bars[-30:-10]]
-    avg_recent = sum(recent_ranges) / len(recent_ranges)
-    avg_prior  = sum(prior_ranges) / len(prior_ranges)
-    return avg_recent < avg_prior * 0.6  # recent range < 60% of prior = compression
+    return all(b["c"] > level for b in bars[-n:])
 
-def get_regime(vix, bars, vwap=None, vwap_history=None):
-    """
-    Classify market regime using VIX + ATR-relative chop detection
-    + point-in-time VWAP crosses + direction changes.
-    Returns: 'HIGH_VOL', 'ELEVATED', 'NORMAL', 'CHOP'
-    """
-    # Macro filter (VIX)
-    if vix and vix >= 30:
-        base_regime = "HIGH_VOL"
-    elif vix and vix >= 20:
-        base_regime = "ELEVATED"
-    else:
-        base_regime = "NORMAL"
-
-    if len(bars) >= 20:
-        recent    = bars[-20:]
-        range_pts = max(b["h"] for b in recent) - min(b["l"] for b in recent)
-
-        # ATR-relative thresholds
-        atr      = calculate_atr(bars, period=14)
-        is_tight = range_pts < (atr * 2.8) if atr else range_pts < 12
-        is_dead  = range_pts < (atr * 1.5) if atr else range_pts < 7
-
-        # Point-in-time VWAP crosses using vwap_history
-        vwap_crosses = 0
-        if vwap_history and len(vwap_history) >= 20:
-            hist_v = vwap_history[-20:]
-            for i in range(1, len(recent)):
-                prev_cross = (recent[i-1]["c"] < hist_v[i-1] and recent[i]["c"] >= hist_v[i])
-                next_cross = (recent[i-1]["c"] > hist_v[i-1] and recent[i]["c"] <= hist_v[i])
-                if prev_cross or next_cross:
-                    vwap_crosses += 1
-        else:
-            vwap_crosses = 0  # no history available yet
-
-        # Direction changes
-        dir_changes = count_direction_changes(recent)
-
-        # Chop classification
-        if is_tight and vwap_crosses >= 4:
-            return "CHOP"
-        if is_dead:
-            return "CHOP"
-        if dir_changes >= 8 and (vwap_crosses >= 3 or is_tight):
-            return "CHOP"
-
-    return base_regime
-
-# ─────────────────────────────────────────
-# TREND DAY DETECTION
-# ─────────────────────────────────────────
-def detect_trend_day(bars, vwap_history, or_high=None, or_low=None):
-    """
-    Detect if today is developing into a trend day.
-    Requires 20 bars and 20 VWAP history readings.
-    Returns: 'BULL_TREND', 'BEAR_TREND', or 'NONE'
-    Also returns 'NONE' if a prior breakout has failed and price rotated back inside OR.
-    """
-    if len(bars) < 20 or not vwap_history or len(vwap_history) < 20:
-        return "NONE"
-
-    recent = bars[-20:]
-    hist_v = vwap_history[-20:]
-
-    # Count bars above/below VWAP
-    closes_above = sum(1 for i in range(len(recent)) if recent[i]["c"] > hist_v[i])
-    closes_below = sum(1 for i in range(len(recent)) if recent[i]["c"] < hist_v[i])
-
-    # Count VWAP crosses in last 20 bars
-    vwap_crosses = 0
-    for i in range(1, len(recent)):
-        prev_above = recent[i-1]["c"] > hist_v[i-1]
-        curr_above = recent[i]["c"] > hist_v[i]
-        if prev_above != curr_above:
-            vwap_crosses += 1
-
-    last_close = recent[-1]["c"]
-    last_vwap  = hist_v[-1]
-    bull_break = or_high is not None and last_close > or_high
-    bear_break = or_low  is not None and last_close < or_low
-
-    # Failed breakout / trend reset — price rotated back inside OR near VWAP
-    # Override any trend classification if this condition is met
-    buffer    = 2
-    inside_or = (or_low + buffer) < last_close < (or_high - buffer) if (or_high is not None and or_low is not None) else False
-    if inside_or and vwap_crosses >= 2 and abs(last_close - last_vwap) < 5:
-        print(f"  → Trend reset: price back inside OR, {vwap_crosses} VWAP crosses, {abs(last_close - last_vwap):.1f}pts from VWAP")
-        return "NONE"
-
-    # Bull trend: price mostly above VWAP, few crosses, OR High broken and holding
-    if closes_above >= 16 and vwap_crosses <= 2 and bull_break:
-        return "BULL_TREND"
-
-    # Bear trend: price mostly below VWAP, few crosses, OR Low broken and holding
-    if closes_below >= 16 and vwap_crosses <= 2 and bear_break:
-        return "BEAR_TREND"
-
-    return "NONE"
-
-def detect_trend_acceleration(bars, trend_day="NONE"):
-    """
-    Detects when a confirmed trend day transitions into a runaway move.
-    Directional — only confirms acceleration aligned with trend_day direction.
-    Only meaningful when trend_day is already confirmed.
-    """
-    if len(bars) < 5 or trend_day == "NONE":
+def bars_below_level(bars, level, n):
+    """Check if last n bars all closed below level."""
+    if len(bars) < n:
         return False
-    last5    = bars[-5:]
-    momentum = last5[-1]["c"] - last5[0]["c"]
-    ranges   = [b["h"] - b["l"] for b in last5]
-    expanding = ranges[-1] > ranges[0]
-    if trend_day == "BULL_TREND":
-        return momentum > 8 and expanding
-    elif trend_day == "BEAR_TREND":
-        return momentum < -8 and expanding
-    return False
+    return all(b["c"] < level for b in bars[-n:])
 
-# ─────────────────────────────────────────
-# WEIGHTED SIGNAL SCORING
-# ─────────────────────────────────────────
-TRIGGER_WEIGHTS = {
-    "vwap_at_key_level": 10,
-    "vwap_reclaim":       7,
-    "vwap_rejection":     7,
-    "or_breakout":        9,
-    "or_breakdown":       9,
-    "pdh_breakout":       8,
-    "pdl_breakdown":      8,
-    "level_breakout":     7,
-    "level_rejection":    5,
-    "level_support":      5,
-    "momentum_surge":     4,
-}
+def is_chop(bars):
+    """Detect choppy price action: too many direction changes, tight range."""
+    if len(bars) < 10:
+        return False
+    recent = bars[-10:]
+    hi = max(b["h"] for b in recent)
+    lo = min(b["l"] for b in recent)
+    range_pts = hi - lo
+    changes = sum(
+        1 for i in range(2, len(recent))
+        if (recent[i]["c"] - recent[i-1]["c"]) * (recent[i-1]["c"] - recent[i-2]["c"]) < 0
+    )
+    return range_pts < 8 or changes >= 6
 
-def score_signal(trigger_type, near_key_level=False):
-    if near_key_level and "vwap" in trigger_type:
-        return TRIGGER_WEIGHTS["vwap_at_key_level"]
-    return TRIGGER_WEIGHTS.get(trigger_type, 5)
-
-# ─────────────────────────────────────────
-# ADAPTIVE EXITS BY SESSION
-# ─────────────────────────────────────────
-def get_session(now_et):
-    t = now_et.time()
-    if t < datetime.time(11, 0):
-        return "MORNING"
-    elif t < datetime.time(14, 0):
-        return "MIDDAY"
-    else:
-        return "AFTERNOON"
-
-def get_exit_params(session, regime, momentum):
-    base_move = max(abs(momentum) * 1.5, 5)
-    if session == "MORNING":
-        t1_mult, t2_mult, stop_pct = 2.0, 4.0, 50
-    elif session == "MIDDAY":
-        t1_mult, t2_mult, stop_pct = 1.5, 2.5, 40
-    else:
-        t1_mult, t2_mult, stop_pct = 1.0, 2.0, 35
-    if regime == "HIGH_VOL":
-        t1_mult *= 1.3
-        t2_mult *= 1.3
-    return {"t1_mult": t1_mult, "t2_mult": t2_mult, "stop_pct": stop_pct, "base_move": base_move}
-
-# ─────────────────────────────────────────
-# SIGNAL ENGINE — VWAP + LEVELS + MOMENTUM
-# ─────────────────────────────────────────
-def evaluate_signal(bars, vwap, key_levels, vix=None, last_signal_price=None,
-                    last_signal_bias=None, last_vwap_signal_time=None,
-                    vwap_history=None, trend_day="NONE"):
+def evaluate_breakout(bars, key_levels, vwap, vix, session,
+                      last_signal_time, last_signal_price, last_signal_bias):
     """
-    Weighted scoring signal engine with full hardening.
-    Score thresholds: CHOP=14, NORMAL=7, ELEVATED=5, HIGH_VOL=4
-    Midday adds +2 to threshold.
+    Pure breakout signal engine.
+
+    Signal fires when:
+    1. SPX breaks a key level (OR High/Low, PDH/PDL, round number, PM High/Low)
+    2. BREAKOUT_CONFIRM_BARS consecutive bars close beyond the level
+    3. Momentum >= BREAKOUT_MIN_MOMENTUM in the break direction
+    4. Not in chop
+    5. VWAP is on the same side (confirming, not filtering)
+    6. Cooldown and distance filters pass
+
+    Also fires on RETEST: price breaks, pulls back to the level, holds.
     """
-    if len(bars) < 10 or not vwap:
+    if len(bars) < 10:
         return None
 
     spot     = bars[-1]["c"]
-    prev     = bars[-2]["c"]
-    momentum = calc_momentum(bars, MOMENTUM_BARS)
+    momentum = calc_momentum(bars, 3)
     now_et   = datetime.datetime.now(ET)
-    session  = get_session(now_et)
-    regime   = get_regime(vix, bars, vwap, vwap_history=vwap_history)
+    regime   = get_regime(vix, bars)
 
-    # Rule 6: Hard suppress ALL signals if too extended from VWAP
-    vwap_distance = abs(spot - vwap) if vwap else 0
-    if vwap_distance > VWAP_MAX_EXTENSION:
-        print(f"  → Hard suppress: {vwap_distance:.0f}pts from VWAP (>{VWAP_MAX_EXTENSION})")
-        return None
+    # Session-aware thresholds
+    if session == "MORNING":
+        confirm_bars  = 1
+        min_momentum  = 4.0
+    elif session == "MIDDAY":
+        confirm_bars  = 2
+        min_momentum  = 2.5
+    else:  # AFTERNOON
+        confirm_bars  = 2
+        min_momentum  = 2.0
 
-    # Extension threshold — widen in trend direction on trend days (must be before too_extended)
-    vwap_break_ext = VWAP_BREAK_EXTENSION  # default 25pts
-    accelerating   = False
-    if trend_day == "BULL_TREND" or trend_day == "BEAR_TREND":
-        vwap_break_ext = 35  # allow continuation further from VWAP on trend days
-        accelerating   = detect_trend_acceleration(bars, trend_day)
-        if accelerating:
-            vwap_break_ext = 45  # runaway move — wider extension allowed
-            print(f"  → TREND ACCELERATION detected: extension widened to {vwap_break_ext}pts")
-
-    too_extended = vwap_distance > vwap_break_ext  # breakout/momentum filter only
-
-    # Rule 3: VWAP flip cooldown
-    vwap_flip_ok = True
-    if last_vwap_signal_time:
-        mins_since_vwap = (now_et - last_vwap_signal_time).total_seconds() / 60
-        if mins_since_vwap < VWAP_FLIP_COOLDOWN:
-            vwap_flip_ok = False
-
-    # Rule 2: Session score threshold adjustment
-    thresholds = {"CHOP": 14, "NORMAL": 7, "ELEVATED": 5, "HIGH_VOL": 4}
-    min_score  = thresholds.get(regime, 7)
-    if session == "MIDDAY":
-        min_score += 2
-
-    # Trend day threshold adjustments
-    # Continuation signals easier, countertrend harder
-    trend_day_bias = None
-    if trend_day == "BULL_TREND":
-        trend_day_bias = "BULL"
-        print(f"  → BULL TREND DAY: lowering bull threshold, raising bear threshold")
-    elif trend_day == "BEAR_TREND":
-        trend_day_bias = "BEAR"
-        print(f"  → BEAR TREND DAY: lowering bear threshold, raising bull threshold")
-
-    near_any_key_level = any(
-        v is not None and abs(spot - v) <= LEVEL_PROXIMITY
-        for k, v in key_levels.items() if k != "VWAP"
-    )
-
-    is_compressed = compression_detected(bars)
-
-    # Rule 4: Minimum bar range for momentum/breakout signals
-    recent_bar_range = bars[-1]["h"] - bars[-1]["l"]
-    momentum_range_ok = recent_bar_range >= 2.0
-
-    signals = []
-
-    # 1. VWAP RECLAIM — gated by flip cooldown
-    if prev < vwap <= spot and bars_confirming(bars, "BULL", n=2) and momentum > 0:
-        if vwap_flip_ok:
-            signals.append({"trigger": "VWAP Reclaim", "bias": "BULL",
-                            "weight": score_signal("vwap_reclaim", near_any_key_level),
-                            "trigger_type": "vwap_reclaim"})
-
-    # 2. VWAP REJECTION — gated by flip cooldown
-    if prev > vwap >= spot and bars_confirming(bars, "BEAR", n=2) and momentum < 0:
-        if vwap_flip_ok:
-            signals.append({"trigger": "VWAP Rejection", "bias": "BEAR",
-                            "weight": score_signal("vwap_rejection", near_any_key_level),
-                            "trigger_type": "vwap_rejection"})
-
-    # 3. KEY LEVEL REACTIONS
-    for name, level in key_levels.items():
-        if level is None or name == "VWAP":
-            continue
-        near = abs(spot - level) <= LEVEL_PROXIMITY
-
-        if "OR" in name:
-            btype, dtype = "or_breakout", "or_breakdown"
-        elif "Prev Day High" in name:
-            btype, dtype = "pdh_breakout", "level_breakout"
-        elif "Prev Day Low" in name:
-            btype, dtype = "level_breakout", "pdl_breakdown"
-        else:
-            btype, dtype = "level_breakout", "level_breakout"
-
-        # Breakout — Rule 3(ext) + Rule 7(OR afternoon) + Rule 4+9(momentum range)
-        if near and prev <= level < spot and momentum > MOMENTUM_MIN_MOVE:
-            is_or = "OR" in name
-            if not too_extended and not (is_or and session == "AFTERNOON") and momentum_range_ok:
-                signals.append({"trigger": f"Breakout above {name} ({level:,.0f})", "bias": "BULL",
-                                "weight": score_signal(btype), "trigger_type": btype})
-
-        # Breakdown — Rule 3(ext) + Rule 7(OR afternoon) + Rule 4+9(momentum range)
-        if near and prev >= level > spot and momentum < -MOMENTUM_MIN_MOVE:
-            is_or = "OR" in name
-            if not too_extended and not (is_or and session == "AFTERNOON") and momentum_range_ok:
-                signals.append({"trigger": f"Breakdown below {name} ({level:,.0f})", "bias": "BEAR",
-                                "weight": score_signal(dtype), "trigger_type": dtype})
-
-        # Rejection — NOT filtered by extension, slower momentum ok (Rule 9 does not apply)
-        if near and spot < level and bars_confirming(bars, "BEAR", n=2) and momentum < -MOMENTUM_MIN_MOVE * 0.5:
-            signals.append({"trigger": f"Rejection at {name} ({level:,.0f})", "bias": "BEAR",
-                            "weight": score_signal("level_rejection"), "trigger_type": "level_rejection"})
-
-        # Support hold — NOT filtered by extension, slower momentum ok (Rule 9 does not apply)
-        if near and spot > level and bars_confirming(bars, "BULL", n=2) and momentum > MOMENTUM_MIN_MOVE * 0.5:
-            signals.append({"trigger": f"Support hold at {name} ({level:,.0f})", "bias": "BULL",
-                            "weight": score_signal("level_support"), "trigger_type": "level_support"})
-
-    # 4. MOMENTUM SURGE — suppressed if extended or weak bar range
-    if abs(momentum) > MOMENTUM_MIN_MOVE * 2 and expanding_range(bars, n=3):
-        bias = "BULL" if momentum > 0 else "BEAR"
-        if bars_confirming(bars, bias, n=3) and not too_extended and momentum_range_ok:
-            signals.append({"trigger": f"Momentum surge ({momentum:+.1f} pts)", "bias": bias,
-                            "weight": score_signal("momentum_surge"), "trigger_type": "momentum_surge"})
-
-    if not signals:
-        return None
-
-    bull_score = sum(s["weight"] for s in signals if s["bias"] == "BULL")
-    bear_score = sum(s["weight"] for s in signals if s["bias"] == "BEAR")
-
-    if bull_score >= bear_score and bull_score > 0:
-        dominant_bias, dominant_score = "BULL", bull_score
-        dominant_sigs = [s for s in signals if s["bias"] == "BULL"]
-    elif bear_score > bull_score:
-        dominant_bias, dominant_score = "BEAR", bear_score
-        dominant_sigs = [s for s in signals if s["bias"] == "BEAR"]
-    else:
-        return None
-
-    # Rule 1: Direction-aware signal distance filter
-    if last_signal_price and last_signal_bias:
-        price_dist = abs(spot - last_signal_price)
-        if price_dist < MIN_SIGNAL_DISTANCE and dominant_bias == last_signal_bias:
-            print(f"  → Distance filter: same dir, only {price_dist:.1f}pts from last signal")
+    # Cooldown check
+    if last_signal_time:
+        mins_since = (now_et - last_signal_time).total_seconds() / 60
+        if mins_since < COOLDOWN_MINUTES:
             return None
 
-    # Trend day threshold adjustment — applied per dominant direction
-    if trend_day_bias:
-        if dominant_bias == trend_day_bias:
-            min_score -= 1  # continuation: easier to fire
-            if accelerating:
-                min_score -= 1  # acceleration: even easier (-2 total vs base)
-                print(f"  → Acceleration bonus: min_score reduced by additional 1")
-        else:
-            min_score += 2  # countertrend: much harder to fire
-
-    # Rule 5: Trend persistence — suppress countertrend only (no boost)
-    if len(bars) >= 10:
-        trend_up   = bars[-1]["c"] > bars[-5]["c"] > bars[-10]["c"]
-        trend_down = bars[-1]["c"] < bars[-5]["c"] < bars[-10]["c"]
-        if dominant_bias == "BULL" and trend_down:
-            dominant_score -= 2
-            print(f"  → Countertrend penalty -2 (BULL vs downtrend)")
-        if dominant_bias == "BEAR" and trend_up:
-            dominant_score -= 2
-            print(f"  → Countertrend penalty -2 (BEAR vs uptrend)")
-
-    # Compression boost — only with momentum confirmation
-    if is_compressed and abs(momentum) > MOMENTUM_MIN_MOVE:
-        dominant_score += 2
-        print(f"  → Compression boost +2")
-
-    # Rule 8: Score cap
-    dominant_score = min(dominant_score, MAX_SIGNAL_SCORE)
-
-    print(f"  → Score: BULL={bull_score} BEAR={bear_score} final={dominant_score} min={min_score} regime={regime} session={session} trend={trend_day} ext={vwap_distance:.0f}pts")
-
-    if dominant_score < min_score:
-        print(f"  → Blocked: {dominant_score} < {min_score}")
+    # Chop filter
+    if is_chop(bars):
+        print(f"  → Chop detected — no signal")
         return None
 
-    # Final momentum sanity check — prevent signals on extremely slow drift
-    if abs(momentum) < MOMENTUM_MIN_MOVE:
-        print(f"  → Final sanity: momentum {momentum:+.1f} below minimum, no signal")
+    # VWAP side (confirming only — not blocking)
+    above_vwap = vwap and spot > vwap
+    below_vwap = vwap and spot < vwap
+
+    candidates = []
+
+    for level_name, level in key_levels.items():
+        if level is None:
+            continue
+
+        # ── BULL BREAKOUT ────────────────────────────────────
+        if spot > level + FOLLOW_THROUGH_MIN:
+            if bars_above_level(bars, level, confirm_bars):
+                if momentum >= min_momentum:
+                    vwap_confirms = above_vwap
+                    score = 8
+                    if vwap_confirms:
+                        score += 2
+                    if "OR" in level_name:
+                        score += 1
+                    if "Prev Day High" in level_name:
+                        score += 1
+                    if "Round" in level_name:
+                        score += 1
+                    candidates.append({
+                        "bias":       "BULL",
+                        "trigger":    f"Breakout above {level_name} ({level:,.0f})",
+                        "level":      level,
+                        "level_name": level_name,
+                        "score":      score,
+                        "type":       "breakout",
+                    })
+                    print(f"  → BULL breakout candidate: {level_name} score={score} mom={momentum:+.1f}")
+
+        # ── BULL RETEST ──────────────────────────────────────
+        elif level < spot <= level + BREAKOUT_RETEST_WINDOW:
+            was_above = any(b["c"] > level + FOLLOW_THROUGH_MIN for b in bars[-RETEST_LOOKBACK:-3])
+            if was_above and momentum >= 0 and above_vwap:
+                candidates.append({
+                    "bias":       "BULL",
+                    "trigger":    f"Retest hold at {level_name} ({level:,.0f})",
+                    "level":      level,
+                    "level_name": level_name,
+                    "score":      7,
+                    "type":       "retest",
+                })
+                print(f"  → BULL retest candidate: {level_name} mom={momentum:+.1f}")
+
+        # ── BEAR BREAKDOWN ───────────────────────────────────
+        if spot < level - FOLLOW_THROUGH_MIN:
+            if bars_below_level(bars, level, confirm_bars):
+                if momentum <= -min_momentum:
+                    vwap_confirms = below_vwap
+                    score = 8
+                    if vwap_confirms:
+                        score += 2
+                    if "OR" in level_name:
+                        score += 1
+                    if "Prev Day Low" in level_name:
+                        score += 1
+                    if "Round" in level_name:
+                        score += 1
+                    candidates.append({
+                        "bias":       "BEAR",
+                        "trigger":    f"Breakdown below {level_name} ({level:,.0f})",
+                        "level":      level,
+                        "level_name": level_name,
+                        "score":      score,
+                        "type":       "breakdown",
+                    })
+                    print(f"  → BEAR breakdown candidate: {level_name} score={score} mom={momentum:+.1f}")
+
+        # ── BEAR RETEST ──────────────────────────────────────
+        elif level - BREAKOUT_RETEST_WINDOW <= spot < level:
+            was_below = any(b["c"] < level - FOLLOW_THROUGH_MIN for b in bars[-RETEST_LOOKBACK:-3])
+            if was_below and momentum <= 0 and below_vwap:
+                candidates.append({
+                    "bias":       "BEAR",
+                    "trigger":    f"Retest fail at {level_name} ({level:,.0f})",
+                    "level":      level,
+                    "level_name": level_name,
+                    "score":      7,
+                    "type":       "retest",
+                })
+                print(f"  → BEAR retest candidate: {level_name} mom={momentum:+.1f}")
+
+    # ── VWAP RECLAIM (BULL) ──────────────────────────────
+    if vwap:
+        prev_close = bars[-2]["c"] if len(bars) >= 2 else None
+        if prev_close and prev_close < vwap <= spot and momentum >= min_momentum:
+            if bars_above_level(bars, vwap, confirm_bars):
+                candidates.append({
+                    "bias":       "BULL",
+                    "trigger":    f"VWAP Reclaim ({vwap:,.2f})",
+                    "level":      vwap,
+                    "level_name": "VWAP",
+                    "score":      9,
+                    "type":       "breakout",
+                })
+                print(f"  → VWAP Reclaim candidate mom={momentum:+.1f}")
+
+        # ── VWAP REJECTION (BEAR) ────────────────────────────
+        if prev_close and prev_close > vwap >= spot and momentum <= -min_momentum:
+            if bars_below_level(bars, vwap, confirm_bars):
+                candidates.append({
+                    "bias":       "BEAR",
+                    "trigger":    f"VWAP Rejection ({vwap:,.2f})",
+                    "level":      vwap,
+                    "level_name": "VWAP",
+                    "score":      9,
+                    "type":       "breakdown",
+                })
+                print(f"  → VWAP Rejection candidate mom={momentum:+.1f}")
+
+    # ── MOMENTUM SURGE (standalone) ──────────────────────
+    # 6+ pts in 3 bars, expanding ranges, no level nearby required
+    surge_threshold = 6.0
+    if abs(momentum) >= surge_threshold:
+        if len(bars) >= 3:
+            ranges   = [b["h"] - b["l"] for b in bars[-3:]]
+            expanding = ranges[-1] > ranges[0]
+            if expanding:
+                bias  = "BULL" if momentum > 0 else "BEAR"
+                vwap_ok = (bias == "BULL" and above_vwap) or (bias == "BEAR" and below_vwap) or not vwap
+                if vwap_ok and bars_above_level(bars, spot - 1, confirm_bars) if bias == "BULL" else bars_below_level(bars, spot + 1, confirm_bars):
+                    near_existing = any(
+                        v is not None and abs(spot - v) <= FOLLOW_THROUGH_MIN
+                        for k, v in key_levels.items() if k != "VWAP"
+                    )
+                    # Only fire surge if NOT already captured by a level breakout
+                    if not near_existing:
+                        candidates.append({
+                            "bias":       bias,
+                            "trigger":    f"Momentum surge ({momentum:+.1f} pts)",
+                            "level":      spot,
+                            "level_name": "Surge",
+                            "score":      8,
+                            "type":       "surge",
+                        })
+                        print(f"  → Momentum surge candidate: {momentum:+.1f}pts expanding={expanding}")
+
+    if not candidates:
         return None
 
-    quality = "STRONG" if dominant_score >= 14 else "HIGH" if dominant_score >= 7 else "MEDIUM"
-    best    = max(dominant_sigs, key=lambda s: s["weight"])
+    # Pick highest score, tiebreak: breakout > retest
+    candidates.sort(key=lambda x: (x["score"], 0 if x["type"] == "breakout" else -1), reverse=True)
+    best = candidates[0]
 
-    exit_p = get_exit_params(session, regime, momentum)
-    base   = exit_p["base_move"]
+    # Distance filter vs last signal (same direction)
+    if last_signal_price and last_signal_bias == best["bias"]:
+        dist = abs(spot - last_signal_price)
+        if dist < 6:
+            print(f"  → Distance filter: {dist:.1f}pts from last {last_signal_bias} signal")
+            return None
 
-    if dominant_bias == "BULL":
+    # Afternoon OR suppression (OR breakouts only in MORNING/MIDDAY)
+    if "OR" in best["level_name"] and session == "AFTERNOON":
+        print(f"  → OR breakout suppressed in AFTERNOON")
+        return None
+
+    # Build exit levels
+    atr = calc_atr(bars)
+    if session == "MORNING":
+        t1_dist, t2_dist = atr * 1.5, atr * 3.0
+        stop_pct = 50
+    elif session == "MIDDAY":
+        t1_dist, t2_dist = atr * 1.0, atr * 2.0
+        stop_pct = 45
+    else:
+        t1_dist, t2_dist = atr * 0.8, atr * 1.5
+        stop_pct = 40
+
+    if regime == "HIGH_VOL":
+        t1_dist *= 1.3
+        t2_dist *= 1.3
+
+    if best["bias"] == "BULL":
         option_type = "CALL"
         strike      = round((spot * 1.002) / 5) * 5
-        invalidate  = round(vwap - 5, 2)
-        target_1    = round(spot + base * exit_p["t1_mult"], 2)
-        target_2    = round(spot + base * exit_p["t2_mult"], 2)
+        target_1    = round(spot + t1_dist, 2)
+        target_2    = round(spot + t2_dist, 2)
+        invalidate  = round(best["level"] - atr * 0.5, 2)
         no_chase    = round(spot + 3, 2)
     else:
         option_type = "PUT"
         strike      = round((spot * 0.998) / 5) * 5
-        invalidate  = round(vwap + 5, 2)
-        target_1    = round(spot - base * exit_p["t1_mult"], 2)
-        target_2    = round(spot - base * exit_p["t2_mult"], 2)
+        target_1    = round(spot - t1_dist, 2)
+        target_2    = round(spot - t2_dist, 2)
+        invalidate  = round(best["level"] + atr * 0.5, 2)
         no_chase    = round(spot - 3, 2)
 
+    quality = "STRONG" if best["score"] >= 11 else "HIGH" if best["score"] >= 9 else "MEDIUM"
+
     return {
-        "trigger":         best["trigger"],
-        "quality":         quality,
-        "score":           dominant_score,
-        "regime":          regime,
-        "session":         session,
-        "bias":            dominant_bias,
-        "option_type":     option_type,
-        "spot":            round(spot, 2),
-        "strike":          strike,
-        "vwap":            vwap,
-        "momentum":        momentum,
-        "invalidate":      invalidate,
-        "target_1":        target_1,
-        "target_2":        target_2,
-        "no_chase":        no_chase,
-        "stop_pct":        exit_p["stop_pct"],
-        "time_stop":       "3:45 PM ET",
-        "vix":             vix,
-        "all_signals":     [s["trigger"] for s in dominant_sigs],
-        "is_vwap_trigger": best["trigger_type"] in ["vwap_reclaim", "vwap_rejection"],
-        "trend_day":       trend_day,
+        "trigger":     best["trigger"],
+        "type":        best["type"],
+        "quality":     quality,
+        "score":       best["score"],
+        "regime":      regime,
+        "session":     session,
+        "bias":        best["bias"],
+        "option_type": option_type,
+        "spot":        round(spot, 2),
+        "strike":      strike,
+        "vwap":        vwap,
+        "momentum":    momentum,
+        "atr":         atr,
+        "vix":         vix,
+        "target_1":    target_1,
+        "target_2":    target_2,
+        "invalidate":  invalidate,
+        "no_chase":    no_chase,
+        "stop_pct":    stop_pct,
+        "time_stop":   "3:45 PM ET",
+        "level":       best["level"],
+        "all_candidates": [c["trigger"] for c in candidates[1:4]],
     }
 
-
-
-# ─────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────
 # ─────────────────────────────────────────
 # SIGNAL LOGGING
 # ─────────────────────────────────────────
-
-SIGNAL_LOG_FILE = "signal_log.csv"
+SIGNAL_LOG_FILE   = "signal_log.csv"
 SIGNAL_LOG_FIELDS = [
-    "timestamp", "trigger", "score", "quality", "regime", "session",
-    "trend_day", "bias", "spot", "vwap", "momentum", "vwap_distance",
-    "target_1", "target_2", "invalidate", "no_chase"
+    "timestamp", "trigger", "type", "score", "quality", "regime", "session",
+    "bias", "spot", "vwap", "momentum", "atr", "level",
+    "target_1", "target_2", "invalidate"
 ]
 
 def log_signal(sig):
-    """Append fired signal to CSV log. Creates header if file doesn't exist."""
     try:
         write_header = not os.path.exists(SIGNAL_LOG_FILE)
         with open(SIGNAL_LOG_FILE, "a", newline="") as f:
@@ -775,117 +549,103 @@ def log_signal(sig):
             if write_header:
                 writer.writeheader()
             writer.writerow({
-                "timestamp":    datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
-                "trigger":      sig.get("trigger", ""),
-                "score":        sig.get("score", ""),
-                "quality":      sig.get("quality", ""),
-                "regime":       sig.get("regime", ""),
-                "session":      sig.get("session", ""),
-                "trend_day":    sig.get("trend_day", "NONE"),
-                "bias":         sig.get("bias", ""),
-                "spot":         sig.get("spot", ""),
-                "vwap":         sig.get("vwap", ""),
-                "momentum":     sig.get("momentum", ""),
-                "vwap_distance": round(abs(sig.get("spot", 0) - sig.get("vwap", 0)), 2) if sig.get("vwap") else "",
-                "target_1":     sig.get("target_1", ""),
-                "target_2":     sig.get("target_2", ""),
-                "invalidate":   sig.get("invalidate", ""),
-                "no_chase":     sig.get("no_chase", ""),
+                "timestamp": datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+                "trigger":   sig.get("trigger", ""),
+                "type":      sig.get("type", ""),
+                "score":     sig.get("score", ""),
+                "quality":   sig.get("quality", ""),
+                "regime":    sig.get("regime", ""),
+                "session":   sig.get("session", ""),
+                "bias":      sig.get("bias", ""),
+                "spot":      sig.get("spot", ""),
+                "vwap":      sig.get("vwap", ""),
+                "momentum":  sig.get("momentum", ""),
+                "atr":       sig.get("atr", ""),
+                "level":     sig.get("level", ""),
+                "target_1":  sig.get("target_1", ""),
+                "target_2":  sig.get("target_2", ""),
+                "invalidate": sig.get("invalidate", ""),
             })
     except Exception as e:
         print(f"[WARN] Signal log failed: {e}")
 
 # ─────────────────────────────────────────
-# ASYNC TELEGRAM QUEUE
+# TELEGRAM
 # ─────────────────────────────────────────
-_telegram_queue = queue.Queue(maxsize=100)
+_telegram_queue  = queue.Queue(maxsize=100)
 
 def _telegram_worker():
-    """Background thread — drains the Telegram queue without blocking the main loop."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     while True:
         message = _telegram_queue.get()
         if message is None:
-            break  # sentinel — graceful shutdown
+            break
         try:
             r = requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
+                "chat_id":    TELEGRAM_CHAT_ID,
+                "text":       message,
                 "parse_mode": "Markdown"
             }, timeout=10)
             if r.status_code == 200:
                 print(f"[TELEGRAM SENT]")
             else:
-                print(f"[TELEGRAM ERROR] {r.status_code}: {r.text}")
+                print(f"[TELEGRAM ERROR] {r.status_code}: {r.text[:100]}")
         except Exception as e:
             print(f"[TELEGRAM ERROR] {e}")
         finally:
             _telegram_queue.task_done()
 
-# Start background Telegram worker thread (daemon — dies with main process)
 _telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
 _telegram_thread.start()
 
 def send_telegram(message):
-    """Non-blocking — enqueues message for background delivery.
-    Drops message if queue is full (extended outage) to prevent memory exhaustion."""
     try:
         _telegram_queue.put_nowait(message)
     except queue.Full:
-        print(f"[TELEGRAM] Queue full — message dropped: {message[:50]}")
+        print(f"[TELEGRAM] Queue full — dropped")
 
-def format_signal_message(sig, alert_count):
-    t      = datetime.datetime.now(ET).strftime("%I:%M %p ET")
-    emoji  = "🟢" if sig["bias"] == "BULL" else "🔴"
-    vix_str = f"{sig['vix']:.1f}" if sig.get("vix") else "N/A"
+def format_signal_message(sig, alert_count, max_alerts):
+    t     = datetime.datetime.now(ET).strftime("%I:%M %p ET")
+    emoji = "🟢" if sig["bias"] == "BULL" else "🔴"
+    type_label = "BREAKOUT" if sig["type"] == "breakout" else "BREAKDOWN" if sig["bias"] == "BEAR" else "RETEST"
 
-    quality_badges = {
-        "STRONG": "⭐⭐ STRONG",
-        "HIGH":   "⭐ HIGH",
-        "MEDIUM": "MEDIUM"
-    }
+    quality_badges = {"STRONG": "⭐⭐ STRONG", "HIGH": "⭐ HIGH", "MEDIUM": "MEDIUM"}
     badge = quality_badges.get(sig["quality"], sig["quality"])
 
-    regime_labels = {
-        "HIGH_VOL":  "🔥 High Vol",
-        "ELEVATED":  "⚡ Elevated",
-        "NORMAL":    "✅ Normal",
-        "CHOP":      "〰️ Chop"
-    }
-    regime_str  = regime_labels.get(sig["regime"], sig["regime"])
-    session_str = sig.get("session", "")
-    trend_str   = f" | {'📈 Bull Trend' if sig.get('trend_day') == 'BULL_TREND' else '📉 Bear Trend' if sig.get('trend_day') == 'BEAR_TREND' else ''}" if sig.get("trend_day") != "NONE" else ""
+    regime_labels  = {"HIGH_VOL": "🔥 High Vol", "ELEVATED": "⚡ Elevated", "NORMAL": "✅ Normal"}
+    regime_str = regime_labels.get(sig["regime"], sig["regime"])
 
-    msg = f"""*SPX 0DTE SIGNAL {emoji} {sig['option_type']}*
+    vix_str  = f"{sig['vix']:.1f}" if sig.get("vix") else "N/A"
+    vwap_str = f"{sig['vwap']:,.2f}" if sig.get("vwap") else "N/A"
+
+    msg = f"""*SPX 0DTE {type_label} {emoji} {sig['option_type']}*
 ━━━━━━━━━━━━━━━━━━━━━━
 *Quality:*  {badge} (score: {sig['score']})
-*Regime:*   {regime_str} | {session_str}{trend_str}
+*Regime:*   {regime_str} | {sig['session']}
 *Trigger:*  {sig['trigger']}
 *Time:*     {t}
 ━━━━━━━━━━━━━━━━━━━━━━
 *Spot:*     {sig['spot']:,.2f}
 *Strike:*   {sig['strike']} {sig['option_type']} 0DTE
-*VWAP:*     {sig['vwap']:,.2f}
-*Momentum:* {sig['momentum']:+.1f} pts
+*VWAP:*     {vwap_str}
+*Momentum:* {sig['momentum']:+.1f} pts  |  *ATR:* {sig['atr']:.1f}
 *VIX:*      {vix_str}
 ━━━━━━━━━━━━━━━━━━━━━━
-*T1:* {sig['target_1']:,.2f} | *T2:* {sig['target_2']:,.2f}
-*Stop:* -{sig['stop_pct']}% premium | SPX {sig['invalidate']:,.2f}
+*T1:* {sig['target_1']:,.2f}  |  *T2:* {sig['target_2']:,.2f}
+*Stop:* -{sig['stop_pct']}% premium  |  SPX {sig['invalidate']:,.2f}
 *No chase:* past {sig['no_chase']:,.2f}
 *Exit by:* {sig['time_stop']}
 ━━━━━━━━━━━━━━━━━━━━━━
-Alert {alert_count}/{MAX_ALERTS_PER_DAY}"""
+Alert {alert_count}/{max_alerts}"""
 
-    if len(sig["all_signals"]) > 1:
-        extras = "\n".join(f"  + {s}" for s in sig["all_signals"][1:])
-        msg += f"\n\n*Also triggered:*\n{extras}"
+    extras = sig.get("all_candidates", [])
+    if extras:
+        msg += "\n\n*Also triggered:*\n" + "\n".join(f"  + {s}" for s in extras)
 
     return msg
 
 def format_premarket_message(vix, key_levels, events):
-    t    = datetime.datetime.now(ET).strftime("%I:%M %p ET")
-    date = datetime.date.today().strftime("%A, %B %d, %Y")
-
+    date    = datetime.date.today().strftime("%A, %B %d, %Y")
     vix_str = f"{vix:.1f}" if vix else "N/A"
 
     levels_str = ""
@@ -895,11 +655,9 @@ def format_premarket_message(vix, key_levels, events):
 
     events_str = "None"
     if events:
-        event_lines = []
-        for e in events:
-            t_str = e["time"].strftime("%I:%M %p ET")
-            event_lines.append(f"  {t_str} — {e['name']}")
-        events_str = "\n".join(event_lines)
+        events_str = "\n".join(
+            f"  {e['time'].strftime('%I:%M %p ET')} — {e['name']}" for e in events
+        )
 
     return f"""*SPX PRE-MARKET BRIEF*
 ━━━━━━━━━━━━━━━━━━━━━━
@@ -912,7 +670,7 @@ def format_premarket_message(vix, key_levels, events):
 {events_str}
 ━━━━━━━━━━━━━━━━━━━━━━
 Scanning 9:30 AM — 3:30 PM ET
-Signals: VWAP reclaim/rejection + key level reactions + momentum surges
+Signals: Breakouts + Breakdowns at key levels with momentum confirmation
 Blackout: 30min before / 1min after events"""
 
 # ─────────────────────────────────────────
@@ -921,47 +679,32 @@ Blackout: 30min before / 1min after events"""
 _last_update_id = None
 
 def poll_telegram_commands(key_levels, today_events):
-    """
-    Poll Telegram for new commands and handle them.
-    Supported: /brief — sends a fresh pre-market brief on demand.
-    """
     global _last_update_id
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         params = {"timeout": 0, "limit": 10}
         if _last_update_id is not None:
             params["offset"] = _last_update_id + 1
-
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
             return
-        updates = r.json().get("result", [])
-        for update in updates:
+        for update in r.json().get("result", []):
             _last_update_id = update["update_id"]
-            msg = update.get("message", {})
-            text = msg.get("text", "").strip().lower()
+            text = update.get("message", {}).get("text", "").strip().lower()
             if text == "/brief":
-                print("[COMMAND] /brief received — building on-demand brief...")
-                vix = get_vix()
-                events = today_events if today_events else get_economic_events()
-                levels = key_levels if key_levels else {}
-                prev = get_prev_day_levels()
-                if prev and not levels:
-                    levels = {
-                        "Prev Day High":  prev["pdh"],
-                        "Prev Day Low":   prev["pdl"],
-                        "Prev Day Close": prev["pdc"],
-                    }
-                brief = format_premarket_message(vix, levels, events)
-                send_telegram(brief)
-                print("[COMMAND] /brief sent.")
+                vix    = get_vix()
+                events = today_events or get_economic_events()
+                send_telegram(format_premarket_message(vix, key_levels, events))
+                print("[COMMAND] /brief sent")
             elif text == "/status":
                 now_str = datetime.datetime.now(ET).strftime("%I:%M %p ET")
-                vix = get_vix()
+                vix     = get_vix()
                 vix_str = f"{vix:.1f}" if vix else "N/A"
-                status = f"✅ *Bot Status*\nTime: {now_str}\nVIX: {vix_str}\nMarket open: {'Yes' if is_market_open() else 'No'}"
-                send_telegram(status)
-                print("[COMMAND] /status sent.")
+                send_telegram(
+                    f"✅ *Bot Status*\nTime: {now_str}\nVIX: {vix_str}\n"
+                    f"Market open: {'Yes' if is_market_open() else 'No'}"
+                )
+                print("[COMMAND] /status sent")
     except Exception as e:
         print(f"[WARN] Command poll error: {e}")
 
@@ -970,105 +713,91 @@ def poll_telegram_commands(key_levels, today_events):
 # ─────────────────────────────────────────
 def main():
     print("=" * 50)
-    print("  SPX 0DTE Signal Bot v3")
+    print("  SPX 0DTE Breakout Bot v4")
     print("=" * 50)
 
-    alert_count      = 0
-    last_signal_time = None
-    premarket_sent   = False
-    last_date        = None
-    today_events     = []
-    key_levels       = {}
+    alert_count       = 0
+    last_signal_time  = None
+    last_signal_price = None
+    last_signal_bias  = None
+    premarket_sent    = False
+    last_date         = None
+    today_events      = []
+    key_levels        = {}
+    last_heartbeat    = None
 
     # Opening range
-    or_high          = None
-    or_low           = None
-    or_set           = False
+    or_high = None
+    or_low  = None
+    or_set  = False
 
-    # VIX spike tracking
-    last_vix         = None
-    last_vix_spike   = None
-
-    # Heartbeat
-    last_heartbeat       = None
-    last_signal_price    = None
-    last_signal_bias      = None
-    last_vwap_signal_time  = None
-    vwap_history           = []
-    trend_day              = "NONE"
-    last_vwap_bar_time     = None
+    # VIX spike
+    last_vix       = None
+    last_vix_spike = None
 
     while True:
         now_et = datetime.datetime.now(ET)
         today  = now_et.date()
 
-        # ── Telegram command polling ─────────────────────────────
         poll_telegram_commands(key_levels, today_events)
 
-        # ── Daily reset ──────────────────────────────────────────
+        # Daily reset
         if last_date != today:
-            alert_count      = 0
-            last_signal_time = None
-            premarket_sent   = False
-            last_date        = today
-            today_events     = []
-            key_levels       = {}
-            or_high          = None
-            or_low           = None
-            or_set           = False
-            last_vix              = None
-            last_vix_spike        = None
-            last_heartbeat        = None
-            last_signal_price     = None
-            last_signal_bias      = None
-            last_vwap_signal_time  = None
-            vwap_history           = []
-            trend_day              = "NONE"
-            last_vwap_bar_time     = None
-            print(f"\n[{now_et.strftime('%H:%M ET')}] New day — counters reset.")
+            alert_count       = 0
+            last_signal_time  = None
+            last_signal_price = None
+            last_signal_bias  = None
+            premarket_sent    = False
+            last_date         = today
+            today_events      = []
+            key_levels        = {}
+            last_heartbeat    = None
+            or_high           = None
+            or_low            = None
+            or_set            = False
+            last_vix          = None
+            last_vix_spike    = None
+            print(f"\n[{now_et.strftime('%H:%M ET')}] New day — reset.")
 
-        # ── Pre-market brief ─────────────────────────────────────
+        # Pre-market brief
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
             print(f"[{now_et.strftime('%H:%M ET')}] Building pre-market brief...")
-
-            vix = get_vix()
+            vix          = get_vix()
             today_events = get_economic_events()
-
-            # Get key levels
-            prev = get_prev_day_levels()
+            prev         = get_prev_day_levels()
             if prev:
                 key_levels = {
                     "Prev Day High":  prev["pdh"],
                     "Prev Day Low":   prev["pdl"],
                     "Prev Day Close": prev["pdc"],
                 }
-
             bars_pm = get_spx_bars(limit=30)
             if bars_pm:
-                spot_pm = bars_pm[-1]["c"]
+                spot_pm     = bars_pm[-1]["c"]
+                # 100-point round numbers (one below, one above)
                 round_below = (spot_pm // 100) * 100
                 round_above = round_below + 100
                 key_levels[f"Round {round_below:.0f}"] = round_below
                 key_levels[f"Round {round_above:.0f}"] = round_above
-                pmh, pml = get_premarket_levels(bars_pm)
-                if pmh: key_levels["PM High"] = pmh
-                if pml: key_levels["PM Low"]  = pml
-
-            # Inject optional GEX levels as key levels if configured
-            if GEX_LEVELS:
-                for name, level in GEX_LEVELS.items():
-                    if level is not None:
-                        key_levels[f"GEX {name}"] = level
-
-            msg = format_premarket_message(vix, key_levels, today_events)
-            send_telegram(msg)
+                # 25-point locals within 50pts of spot (e.g. 6825, 6850)
+                for offset in [-50, -25, 25, 50]:
+                    lvl = round((spot_pm + offset) / 25) * 25
+                    name = f"R{lvl:.0f}"
+                    # Don't duplicate 100-pt rounds
+                    if lvl % 100 != 0 and name not in key_levels:
+                        key_levels[name] = float(lvl)
+                # PM high/low from bars before 9:30
+                pm_bars = [b for b in bars_pm if b.get("t") and
+                           datetime.datetime.fromtimestamp(b["t"]/1000, ET).time() < datetime.time(9, 30)]
+                if pm_bars:
+                    key_levels["PM High"] = round(max(b["h"] for b in pm_bars), 2)
+                    key_levels["PM Low"]  = round(min(b["l"] for b in pm_bars), 2)
+            send_telegram(format_premarket_message(vix, key_levels, today_events))
             print(f"[TELEGRAM SENT] Pre-market brief")
             premarket_sent = True
 
-        # ── RTH signal loop ──────────────────────────────────────
-        if is_market_open() and in_entry_window():
-
-            # Blackout check
+        # RTH loop
+        if is_market_open():
             in_blackout, event_name, mins_away, when = check_event_blackout(today_events)
             if in_blackout:
                 print(f"[{now_et.strftime('%H:%M ET')}] BLACKOUT — {event_name} ({mins_away}min {when})")
@@ -1076,161 +805,111 @@ def main():
                 continue
 
             if alert_count >= MAX_ALERTS_PER_DAY:
-                print(f"[{now_et.strftime('%H:%M ET')}] Max alerts hit.")
+                print(f"[{now_et.strftime('%H:%M ET')}] Max alerts reached.")
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            bars = get_spx_bars(limit=60)
+            bars = get_spx_bars(limit=80)
             if not bars or len(bars) < 10:
-                print(f"[{now_et.strftime('%H:%M ET')}] Not enough bars.")
+                print(f"[{now_et.strftime('%H:%M ET')}] Insufficient bars ({len(bars) if bars else 0}).")
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
             spot     = bars[-1]["c"]
             vix      = get_vix()
             vwap     = calc_vwap(bars)
-            momentum = calc_momentum(bars, MOMENTUM_BARS)
+            momentum = calc_momentum(bars, 3)
+            session  = get_session(now_et)
+            vix_str  = f"{vix:.1f}" if vix else "N/A"
 
-            # Update VWAP in key levels and history — only on new minute bar
-            if vwap and bars[-1].get("t"):
-                current_bar_time = bars[-1]["t"]
-                if current_bar_time != last_vwap_bar_time:
-                    last_vwap_bar_time = current_bar_time
-                    key_levels["VWAP"] = vwap
-                    vwap_history.append(vwap)
-                    if len(vwap_history) > 60:
-                        vwap_history.pop(0)
-            elif vwap:
-                key_levels["VWAP"] = vwap  # always keep key_levels current
+            print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={vwap} VIX={vix_str} Mom={momentum:+.1f} Alerts={alert_count}/{MAX_ALERTS_PER_DAY}")
 
-            vix_str = f"{vix:.1f}" if vix else "N/A"
-            print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={vwap} VIX={vix_str} Mom={momentum:+.1f} OR={or_high}/{or_low} Alerts={alert_count}/{MAX_ALERTS_PER_DAY}")
+            # VIX to key_levels for display only
+            if vwap:
+                key_levels["VWAP"] = vwap
 
-            # ── Opening Range (first 15 min: 9:30-9:45) ──────────
-            market_open_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-            or_end_time      = now_et.replace(hour=9, minute=45, second=0, microsecond=0)
-
-            if now_et < or_end_time:
-                # Still building opening range
+            # Opening range (9:30–9:45)
+            or_end = now_et.replace(hour=9, minute=45, second=0, microsecond=0)
+            or_start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            if now_et < or_end:
                 rth_bars = [b for b in bars if b.get("t") and
-                            datetime.datetime.fromtimestamp(b["t"]/1000, ET) >= market_open_time]
+                            datetime.datetime.fromtimestamp(b["t"]/1000, ET) >= or_start]
                 if rth_bars:
                     or_high = max(b["h"] for b in rth_bars)
                     or_low  = min(b["l"] for b in rth_bars)
-                print(f"  → Building opening range: {or_low} - {or_high}")
+                print(f"  → Building OR: {or_low} - {or_high}")
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
-
             elif not or_set and or_high and or_low:
-                # Opening range just locked in
                 or_set = True
                 key_levels["OR High"] = round(or_high, 2)
                 key_levels["OR Low"]  = round(or_low, 2)
-                print(f"  → Opening range set: {or_low:.2f} - {or_high:.2f}")
-                send_telegram(f"📊 *Opening Range Set*\nHigh: {or_high:,.2f}\nLow: {or_low:,.2f}\nScanning for breakouts...")
+                print(f"  → OR locked: {or_low:.2f} - {or_high:.2f}")
+                send_telegram(
+                    f"📊 *Opening Range Set*\nHigh: {or_high:,.2f}\nLow: {or_low:,.2f}\nScanning for breakouts..."
+                )
 
-            # ── Trend Day Detection (runs every cycle after OR set) ──
-            if or_set:
-                new_trend = detect_trend_day(bars, vwap_history, or_high=or_high, or_low=or_low)
-                if new_trend != trend_day:
-                    if new_trend == "NONE" and trend_day != "NONE":
-                        send_telegram(f"🔄 *Trend Reset*\nPrior {trend_day} invalidated — price back inside OR\nReturning to normal signal mode")
-                        print(f"  → TREND RESET: {trend_day} → NONE")
-                    elif new_trend != "NONE":
-                        emoji = "📈" if new_trend == "BULL_TREND" else "📉"
-                        send_telegram(f"{emoji} *Trend Day Detected: {new_trend}*\nSPX={spot:,.2f} | VWAP={vwap}\nContinuation signals prioritized. Fades suppressed.")
-                        print(f"  → TREND DAY: {new_trend}")
-                    trend_day = new_trend
-
-            # ── VIX Spike Alert ───────────────────────────────────
+            # VIX spike alert
             if vix and last_vix:
-                vix_chg_pct = (vix - last_vix) / last_vix * 100
-                if vix_chg_pct >= 8 and last_vix_spike != round(vix, 1):
+                vix_chg = (vix - last_vix) / last_vix * 100
+                if vix_chg >= 8 and last_vix_spike != round(vix, 1):
                     last_vix_spike = round(vix, 1)
-                    send_telegram(f"⚠️ *VIX SPIKE ALERT*\nVIX jumped {vix_chg_pct:+.1f}% → {vix:.1f}\nSPX={spot:,.2f}\nExpect volatility — wait for direction before entry")
-                    print(f"  → VIX SPIKE: {last_vix:.1f} → {vix:.1f} ({vix_chg_pct:+.1f}%)")
+                    send_telegram(
+                        f"⚠️ *VIX SPIKE*\nVIX {last_vix:.1f} → {vix:.1f} ({vix_chg:+.1f}%)\n"
+                        f"SPX={spot:,.2f}\nWait for direction before entry"
+                    )
             if vix:
                 last_vix = vix
 
-            # ── Hourly Heartbeat ──────────────────────────────────
+            # Hourly heartbeat
             if last_heartbeat is None or (now_et - last_heartbeat).total_seconds() >= 3600:
                 last_heartbeat = now_et
-                send_telegram(f"💓 *Bot Heartbeat* — {now_et.strftime('%I:%M %p ET')}\nSPX={spot:,.2f} | VWAP={vwap} | VIX={vix_str}\nAlerts today: {alert_count}/{MAX_ALERTS_PER_DAY}")
-                print(f"  → Heartbeat sent")
+                send_telegram(
+                    f"💓 *Bot Heartbeat* — {now_et.strftime('%I:%M %p ET')}\n"
+                    f"SPX={spot:,.2f} | VWAP={vwap} | VIX={vix_str}\n"
+                    f"Alerts today: {alert_count}/{MAX_ALERTS_PER_DAY}"
+                )
 
-            # ── Bar continuity guard ─────────────────────────────
-            bars_ok = True
-            if len(bars) >= 2:
-                for i in range(len(bars)-1, max(len(bars)-6, 0), -1):
-                    if bars[i].get("t") and bars[i-1].get("t"):
-                        gap = (bars[i]["t"] - bars[i-1]["t"]) / 1000  # ms to seconds
-                        if gap > 90:  # more than 90s = gap in data
-                            print(f"[{now_et.strftime('%H:%M ET')}] Bar gap detected ({gap:.0f}s) — skipping cycle")
-                            bars_ok = False
-                            break
-            if not bars_ok:
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── Warm-up guard — require minimum state before signaling ──
-            if len(vwap_history) < 10:
-                print(f"[{now_et.strftime('%H:%M ET')}] Warming up ({len(vwap_history)}/10 VWAP readings)...")
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── Telegram thread health check ──────────────────────
+            # Telegram thread health
             global _telegram_thread
             if not _telegram_thread.is_alive():
-                print("[WARN] Telegram worker thread died — restarting...")
+                print("[WARN] Telegram thread dead — restarting")
                 _telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
                 _telegram_thread.start()
 
-            # ── Signal evaluation ─────────────────────────────────
-            cooldown_ok = True
-            if last_signal_time:
-                mins = (now_et - last_signal_time).total_seconds() / 60
-                if mins < COOLDOWN_MINUTES:
-                    cooldown_ok = False
-
-            if cooldown_ok:
-                sig = evaluate_signal(
-                    bars, vwap, key_levels, vix=vix,
-                    last_signal_price=last_signal_price,
-                    last_signal_bias=last_signal_bias,
-                    last_vwap_signal_time=last_vwap_signal_time,
-                    vwap_history=vwap_history,
-                    trend_day=trend_day
+            # Only signal after OR is set and in entry window
+            if or_set and now_et.time() <= datetime.time(15, 30):
+                sig = evaluate_breakout(
+                    bars, key_levels, vwap, vix, session,
+                    last_signal_time, last_signal_price, last_signal_bias
                 )
                 if sig:
-                    alert_count          += 1
-                    last_signal_time      = now_et
-                    last_signal_price     = sig["spot"]
-                    last_signal_bias      = sig["bias"]
-                    if sig.get("is_vwap_trigger"):
-                        last_vwap_signal_time = now_et
-                    msg = format_signal_message(sig, alert_count)
+                    alert_count      += 1
+                    last_signal_time  = now_et
+                    last_signal_price = sig["spot"]
+                    last_signal_bias  = sig["bias"]
+                    msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
                     send_telegram(msg)
                     log_signal(sig)
-                    print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['quality']} (score={sig['score']})")
+                    print(f"  → SIGNAL: {sig['trigger']} | {sig['bias']} | {sig['quality']} score={sig['score']}")
                 else:
-                    print(f"  → No signal | VWAP={vwap} Mom={momentum:+.1f}")
+                    print(f"  → No breakout signal")
+            elif not or_set:
+                print(f"  → Waiting for OR to be set")
 
-        elif is_market_open() and not in_entry_window():
-            print(f"[{now_et.strftime('%H:%M ET')}] Outside entry window.")
-
-        elif not is_market_open() and not is_premarket():
+        else:
             print(f"[{now_et.strftime('%H:%M ET')}] Market closed.")
 
         time.sleep(POLL_INTERVAL_SEC)
 
 # ─────────────────────────────────────────
-# HEALTH CHECK SERVER
+# HEALTH CHECK
 # ─────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "bot": "SPX 0DTE Signal Bot v3"}, 200
+    return {"status": "ok", "bot": "SPX 0DTE Breakout Bot v4"}, 200
 
 @app.route("/")
 def index():
@@ -1243,11 +922,11 @@ def run_health_server():
 if __name__ == "__main__":
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
-    print(f"[HEALTH] Health check server started on port {os.environ.get('PORT', 8080)}")
+    print(f"[HEALTH] Server started on port {os.environ.get('PORT', 8080)}")
     while True:
         try:
             main()
         except Exception as e:
-            print(f"[CRITICAL] main() crashed: {e} — restarting in 30s")
-            send_telegram(f"⚠️ *Bot Crashed*\nError: {str(e)[:100]}\nRestarting in 30 seconds...")
+            print(f"[CRITICAL] Crashed: {e} — restarting in 30s")
+            send_telegram(f"⚠️ *Bot Crashed*\n{str(e)[:100]}\nRestarting in 30s...")
             time.sleep(30)
