@@ -881,11 +881,22 @@ def main():
                 ).strftime("%H:%M ET") if closed_bars[-1].get("t") else "no-ts"
                 print(f"  [BAR] last completed bar: {last_bar_dt} close={closed_bars[-1]['c']:,.2f}")
 
-            if new_bar and closed_vwap:
-                vwap_history.append(closed_vwap)
-                if len(vwap_history) > 60:
-                    vwap_history.pop(0)
+            # Stale data guard — skip signal eval if last completed bar is too old
+            if closed_bars and closed_bars[-1].get("t"):
+                last_bar_ts = datetime.datetime.fromtimestamp(closed_bars[-1]["t"] / 1000, ET)
+                bar_age     = (now_et - last_bar_ts).total_seconds()
+                if bar_age > 180:
+                    print(f"[WARN] Data stale ({int(bar_age)}s old) — skipping signal evaluation")
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+            if new_bar:
                 last_bar_time = completed_bar_t
+
+                if closed_vwap is not None:
+                    vwap_history.append(closed_vwap)
+                    if len(vwap_history) > 60:
+                        vwap_history.pop(0)
 
             if closed_vwap:
                 key_levels["VWAP"] = closed_vwap
