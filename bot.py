@@ -10,12 +10,13 @@ from flask import Flask
 
 # Daily levels context (optional — bot runs normally if file missing)
 try:
-    from daily_levels import get_alert_context, get_bias
+    from daily_levels import get_alert_context, get_bias, DAILY_LEVELS
     _LEVELS_LOADED = True
     print("[LEVELS] daily_levels.py loaded successfully")
 except ImportError:
     _LEVELS_LOADED = False
     get_bias = None
+    DAILY_LEVELS = {}
     print("[LEVELS] daily_levels.py not found — running without level context")
 
 # ─────────────────────────────────────────
@@ -631,6 +632,35 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
     best["counter_trend"]  = counter_trend
     best["structure_bias"] = structure_bias
 
+    # ── Structural trend state (classification only — no gating) ──
+    structure_state = "NORMAL"
+    if _LEVELS_LOADED:
+        try:
+            price = best["spot"]
+            pivot = DAILY_LEVELS["bull_bear_pivot"]
+            r1    = DAILY_LEVELS["R1"]
+            r2    = DAILY_LEVELS["R2"]
+            if signal_long:
+                # Bullish signal — full state ladder
+                if price > r2:
+                    structure_state = "STRONG TREND"
+                elif price > r1:
+                    structure_state = "TREND CONTINUATION"
+                elif price > pivot:
+                    structure_state = "NORMAL"
+                else:
+                    structure_state = "BELOW PIVOT"
+            else:
+                # Bearish signal — simplified two-state
+                if price <= pivot:
+                    structure_state = "BELOW PIVOT"
+                else:
+                    structure_state = "ABOVE PIVOT"
+        except Exception:
+            structure_state = "NORMAL"
+    best["structure_state"] = structure_state
+    print(f"  -> Structure state: {structure_state}")
+
     # ── Improvement 2: Higher score required for counter-trend momentum ──
     if counter_trend and best.get("signal_type") == "MOMENTUM":
         base_min = {"MORNING": 8, "MIDDAY": 7, "AFTERNOON": 6}.get(session, 7)
@@ -767,6 +797,52 @@ def format_signal_message(sig, alert_count, max_alerts):
     # Counter-trend warning (improvement 1)
     if sig.get("counter_trend") and sig.get("structure_bias"):
         msg += f"\n\n\u26a0\ufe0f *COUNTER-TREND vs STRUCTURE*\nStructure Bias: {sig['structure_bias']} | Signal: {sig['bias']}"
+    # Structure state line
+    state = sig.get("structure_state")
+    if state:
+        pivot = DAILY_LEVELS.get("bull_bear_pivot", "")
+        r1    = DAILY_LEVELS.get("R1", "")
+        r2    = DAILY_LEVELS.get("R2", "")
+        if state == "STRONG TREND":
+            state_str = f"STRONG TREND above R2 ({r2})"
+        elif state == "TREND CONTINUATION":
+            state_str = f"TREND CONTINUATION above R1 ({r1})"
+        elif state == "BELOW PIVOT":
+            state_str = f"BELOW PIVOT ({pivot}) — short bias"
+        elif state == "ABOVE PIVOT":
+            state_str = f"ABOVE PIVOT ({pivot}) — short signal"
+        else:
+            state_str = f"NORMAL — above pivot ({pivot}), below R1 ({r1})"
+        msg += f"\n*STRUCTURE:* {state_str}"
+    # Level proximity note — informational only, no gating
+    if _LEVELS_LOADED:
+        try:
+            price = sig["spot"]
+            PROXIMITY_THRESHOLD = 8
+            proximity_levels = [
+                (DAILY_LEVELS.get("bull_bear_pivot"), "Pivot"),
+                (DAILY_LEVELS.get("R1"),              "R1 resistance"),
+                (DAILY_LEVELS.get("R2"),              "R2 resistance"),
+                (DAILY_LEVELS.get("R3"),              "R3 resistance"),
+                (DAILY_LEVELS.get("daily_1sd_upper"), "Daily 1SD Upper"),
+                (DAILY_LEVELS.get("daily_1sd_lower"), "Daily 1SD Lower"),
+                (DAILY_LEVELS.get("daily_2sd_upper"), "Daily 2SD Upper"),
+                (DAILY_LEVELS.get("daily_2sd_lower"), "Daily 2SD Lower"),
+                (DAILY_LEVELS.get("vwap_daily"),      "Daily VWAP"),
+            ]
+            nearest = None
+            nearest_dist = PROXIMITY_THRESHOLD + 1
+            for lvl, label in proximity_levels:
+                if lvl is None:
+                    continue
+                dist = abs(price - lvl)
+                if dist <= PROXIMITY_THRESHOLD and dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest = label
+            if nearest:
+                msg += f"\n*LEVELS:* Near {nearest}"
+        except Exception:
+            pass
     # Append daily level context
     if _LEVELS_LOADED:
         try:
