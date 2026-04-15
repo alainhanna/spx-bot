@@ -1,7 +1,7 @@
 # ============================================================
 # SPX DAILY LEVELS — Generated from John's charts
-# Date: April 14, 2026
-# Current Price at capture: ~6,886–6,889
+# Date: April 15, 2026
+# Current Price at capture: ~6,969
 #
 # IMPORTANT: This file is CONTEXT ONLY.
 # It does not gate, suppress, or override signals.
@@ -12,18 +12,17 @@
 DAILY_LEVELS = {
 
     # ── BULL/BEAR PIVOT ─────────────────────────────────────
-    # DO NOT use static bias — always calculate dynamically:
     # bias = "long" if price > bull_bear_pivot else "short"
-    "bull_bear_pivot": 6852,        # key line in sand
+    "bull_bear_pivot": 6960,
 
     # ── GAMMA FLIP ──────────────────────────────────────────
-    "gamma_flip": 6751,             # dealer hedging flip point
+    "gamma_flip": 6763,
 
     # ── STANDARD DEVIATION BANDS ────────────────────────────
-    "daily_1sd_upper": 6927,
-    "daily_1sd_lower": 6845,        # also = 2025 closing price
-    "daily_2sd_upper": 6969,        # extreme — reduce confidence near here
-    "daily_2sd_lower": 6804,        # extreme — reduce confidence near here
+    "daily_1sd_upper": 7011,
+    "daily_1sd_lower": 6924,
+    "daily_2sd_upper": 7054,
+    "daily_2sd_lower": 6879,
     "weekly_1sd_upper": 6940,
     "weekly_1sd_lower": 6693,
     "weekly_2sd_upper": 7063,
@@ -42,100 +41,107 @@ DAILY_LEVELS = {
     "q2_lower": 5861,
 
     # ── PIVOT POINTS (Classic R/S) ──────────────────────────
-    "R3": 7008,
-    "R2": 6945,
-    "R1": 6915,
-    "S1": 6823,
-    "S2": 6759,
-    "S3": 6729,
+    "R3": 7002,
+    "R2": 6986,
+    "R1": 6977,
+    "S1": 6950,
+    "S2": 6934,
+    "S3": 6925,
 
     # ── MOVING AVERAGES ─────────────────────────────────────
     "dma": {
-        5:   6785,
-        20:  6609,
+        5:   6855,
+        20:  6621,
         50:  6754,
-        100: 6805,
-        200: 6669,
+        100: 6809,
+        200: 6673,
     },
 
     # ── REFERENCE / CLOSING PRICES ──────────────────────────
-    "close_2025": 6845,             # also = daily 1SD lower
+    "close_2025": 6845,
 
-    # ── KEY PRICE LADDER (Chart 2) ──────────────────────────
+    # ── VWAP LEVELS (Chart 2 — SPX VWAPs) ──────────────────
+    "vwap_daily":  6952.85,
+    "vwap_wtd":    6901.82,
+    "vwap_level3": 6876.42,
+    "vwap_level4": 6858.90,
+
+    # ── KEY PRICE LADDER (Chart 2 — SPX VWAPs) ──────────────
     "key_price_ladder": {
-        "nov_low":        6822.80,
-        "ytd":            6815.89,
-        "ath":            6815.29,
-        "aug_low":        6810.60,
-        "mtd":            6797.44,
-        "level_6769":     6769.16,
-        "ytd_low":        6749.11,
-        "level_6727":     6727.11,  # 12th May gap up
-        "level_6680":     6680.15,
-        "level_6629":     6629.42,
-        "level_6581":     6581.77,
-        "april_2025_low": 6465.45,
-        "vwap_2025":      6332.75,
+        "nov_low":        6812.29,
+        "ytd":            6808.31,
+        "ath":            6773.37,
+        "aug_low":        6729.19,
+        "mtd":            6728.92,
+        "ytd_low":        6679.18,
+        "may_gap_up":     6584.31,
+        "april_2025_low": 6468.57,
+        "vwap_2025":      6335.99,
     },
 
-    # ── NEAREST LEVELS TO CURRENT PRICE (~6889) ─────────────
+    # ── NEAREST RESISTANCE to ~6969 ─────────────────────────
     "nearest_resistance": [
-        {"level": 6905,  "label": "Monthly 1SD Upper"},
-        {"level": 6915,  "label": "R1"},
-        {"level": 6927,  "label": "Daily 1SD Upper"},
-        {"level": 6940,  "label": "Weekly 1SD Upper"},
-        {"level": 6945,  "label": "R2"},
-        {"level": 6969,  "label": "Daily 2SD Upper"},
-        {"level": 7008,  "label": "R3"},
+        {"level": 6977,  "label": "R1"},
+        {"level": 6986,  "label": "R2"},
+        {"level": 7002,  "label": "R3"},
+        {"level": 7011,  "label": "Daily 1SD Upper"},
+        {"level": 7054,  "label": "Daily 2SD Upper"},
         {"level": 7063,  "label": "Weekly 2SD Upper"},
         {"level": 7195,  "label": "Q2 Upper"},
         {"level": 7300,  "label": "Monthly 2SD Upper"},
     ],
+
+    # ── NEAREST SUPPORT to ~6969 ────────────────────────────
     "nearest_support": [
-        {"level": 6852,  "label": "Bull/Bear Pivot"},
-        {"level": 6845,  "label": "Daily 1SD Lower / 2025 Close"},
-        {"level": 6823,  "label": "S1 / Nov Low"},
-        {"level": 6815,  "label": "ATH / YTD"},
-        {"level": 6805,  "label": "100 DMA"},
-        {"level": 6804,  "label": "Daily 2SD Lower"},
-        {"level": 6797,  "label": "MTD"},
-        {"level": 6785,  "label": "5 DMA"},
-        {"level": 6769,  "label": "Key Level"},
-        {"level": 6759,  "label": "S2"},
+        {"level": 6960,  "label": "Bull/Bear Pivot"},
+        {"level": 6952,  "label": "Daily VWAP"},
+        {"level": 6940,  "label": "Weekly 1SD Upper"},
+        {"level": 6934,  "label": "S2"},
+        {"level": 6925,  "label": "S3"},
+        {"level": 6924,  "label": "Daily 1SD Lower"},
+        {"level": 6905,  "label": "Monthly 1SD Upper"},
+        {"level": 6901,  "label": "WTD VWAP"},
+        {"level": 6879,  "label": "Daily 2SD Lower"},
+        {"level": 6855,  "label": "5 DMA"},
+        {"level": 6845,  "label": "2025 Closing Price"},
+        {"level": 6812,  "label": "Nov Low"},
+        {"level": 6809,  "label": "100 DMA"},
+        {"level": 6808,  "label": "YTD"},
+        {"level": 6773,  "label": "ATH"},
+        {"level": 6763,  "label": "Gamma Flip"},
         {"level": 6754,  "label": "50 DMA"},
-        {"level": 6751,  "label": "Gamma Flip"},
-        {"level": 6749,  "label": "YTD Low"},
-        {"level": 6729,  "label": "S3"},
+        {"level": 6729,  "label": "Aug Low"},
         {"level": 6693,  "label": "Weekly 1SD Lower"},
-        {"level": 6669,  "label": "200 DMA"},
+        {"level": 6679,  "label": "YTD Low"},
+        {"level": 6673,  "label": "200 DMA"},
+        {"level": 6621,  "label": "20 DMA"},
     ],
 
     # ── SCENARIO MAP ────────────────────────────────────────
     "scenarios": {
         "bull": {
-            "condition": "Holds above 6852 pivot",
-            "targets": [6905, 6915, 6927, 6945, 6969],
-            "description": "Monthly 1SD → R1 → Daily 1SD Upper → R2 → Daily 2SD"
+            "condition": "Holds above Bull/Bear Pivot 6960",
+            "targets": [6977, 6986, 7002, 7011, 7054],
+            "description": "R1 → R2 → R3 → Daily 1SD Upper → Daily 2SD Upper"
         },
         "bear": {
-            "condition": "Loses 6852 pivot",
-            "targets": [6845, 6823, 6805, 6785, 6754, 6751],
-            "description": "2025 Close/1SD Lower → S1 → 100DMA → 5DMA → 50DMA → Gamma Flip"
+            "condition": "Loses Bull/Bear Pivot 6960",
+            "targets": [6952, 6940, 6924, 6905, 6879],
+            "description": "Daily VWAP → Weekly 1SD Upper → Daily 1SD Lower → Monthly 1SD → Daily 2SD Lower"
         },
         "chop": {
-            "range_low":  6845,
-            "range_high": 6927,
+            "range_low":  6924,
+            "range_high": 7011,
             "description": "Inside daily 1SD band — no directional edge"
         }
     }
 }
 
 
-# ── HELPER: dynamic bias (always call this, never use static field) ──
+# ── HELPER: dynamic bias ─────────────────────────────────────
 def get_bias(price):
     """Dynamically calculate bias from live price vs pivot. Never use static."""
-    pivot = DAILY_LEVELS["bull_bear_pivot"]
-    return "long" if price > pivot else "short"
+    return "long" if price > DAILY_LEVELS["bull_bear_pivot"] else "short"
 
 
 # ── HELPER: distance to a single level ──────────────────────
@@ -180,8 +186,6 @@ def get_confidence_modifier(price):
 def get_alert_context(price):
     """
     Returns a formatted context string to append to Telegram signal alerts.
-    Example output:
-      Bias: LONG | Pivot: 6852 | R: 6905 (Monthly 1SD, 16pts) | S: 6852 (Pivot, 37pts) | WATCH: Approaching Daily 1SD Upper
     """
     bias   = get_bias(price).upper()
     pivot  = DAILY_LEVELS["bull_bear_pivot"]
