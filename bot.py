@@ -10,11 +10,12 @@ from flask import Flask
 
 # Daily levels context (optional — bot runs normally if file missing)
 try:
-    from daily_levels import get_alert_context
+    from daily_levels import get_alert_context, get_bias
     _LEVELS_LOADED = True
     print("[LEVELS] daily_levels.py loaded successfully")
 except ImportError:
     _LEVELS_LOADED = False
+    get_bias = None
     print("[LEVELS] daily_levels.py not found — running without level context")
 
 # ─────────────────────────────────────────
@@ -603,6 +604,54 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
         print(f"  -> OR suppressed in AFTERNOON")
         return None
 
+    # ── Improvements 1 & 5: Structure bias + trade type classification ──
+    structure_bias = None
+    if _LEVELS_LOADED:
+        try:
+            structure_bias = get_bias(best["spot"]).upper()  # "LONG" or "SHORT"
+        except Exception:
+            structure_bias = None
+
+    signal_long   = (best["bias"] == "BULL")
+    structure_long = (structure_bias == "LONG") if structure_bias else None
+
+    if best.get("signal_type") == "BREAKOUT":
+        trade_type = "BREAKOUT"
+    elif best.get("signal_type") == "BREAKDOWN":
+        trade_type = "BREAKDOWN"
+    elif structure_long is None:
+        trade_type = "MOMENTUM"
+    elif signal_long == structure_long:
+        trade_type = "TREND_CONTINUATION"
+    else:
+        trade_type = "COUNTER_TREND_PULLBACK"
+
+    counter_trend = (trade_type == "COUNTER_TREND_PULLBACK")
+    best["trade_type"]     = trade_type
+    best["counter_trend"]  = counter_trend
+    best["structure_bias"] = structure_bias
+
+    # ── Improvement 2: Higher score required for counter-trend momentum ──
+    if counter_trend and best.get("signal_type") == "MOMENTUM":
+        base_min = {"MORNING": 8, "MIDDAY": 7, "AFTERNOON": 6}.get(session, 7)
+        min_score_ct = base_min + 2
+        if best["score"] < min_score_ct:
+            print(f"  -> Counter-trend filter blocked (score={best['score']} < {min_score_ct})")
+            return None
+        best["momentum_threshold_numeric"] = min_score_ct
+        best["filter_context"]             = "COUNTER_TREND_PLUS_2"
+    else:
+        base_min = {"MORNING": 8, "MIDDAY": 7, "AFTERNOON": 6}.get(session, 7)
+        best["momentum_threshold_numeric"] = base_min
+        best["filter_context"]             = "BASE"
+
+    # ── Improvement 3: After 14:30 only STRONG signals pass ──
+    if now_et.time() >= datetime.time(14, 30):
+        if best["quality"] != "STRONG":
+            print(f"  -> Late-day filter blocked (quality={best['quality']}, STRONG required after 14:30)")
+            return None
+        best["filter_context"] = "LATE_DAY_STRONG_ONLY"
+
     return best
 
 # ─────────────────────────────────────────
@@ -611,7 +660,9 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
 SIGNAL_LOG_FILE   = "signal_log.csv"
 SIGNAL_LOG_FIELDS = [
     "timestamp", "signal_type", "trigger", "score", "quality", "regime", "session",
-    "bias", "spot", "vwap", "momentum", "atr", "level", "target_1", "target_2", "invalidate"
+    "bias", "spot", "vwap", "momentum", "atr", "level", "target_1", "target_2", "invalidate",
+    "trade_type", "counter_trend", "structure_bias",
+    "momentum_threshold_numeric", "filter_context"
 ]
 
 def log_signal(sig):
@@ -622,22 +673,27 @@ def log_signal(sig):
             if write_header:
                 writer.writeheader()
             writer.writerow({
-                "timestamp":   datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
-                "signal_type": sig.get("signal_type", ""),
-                "trigger":     sig.get("trigger", ""),
-                "score":       sig.get("score", ""),
-                "quality":     sig.get("quality", ""),
-                "regime":      sig.get("regime", ""),
-                "session":     sig.get("session", ""),
-                "bias":        sig.get("bias", ""),
-                "spot":        sig.get("spot", ""),
-                "vwap":        sig.get("vwap", ""),
-                "momentum":    sig.get("momentum", ""),
-                "atr":         sig.get("atr", ""),
-                "level":       sig.get("level", ""),
-                "target_1":    sig.get("target_1", ""),
-                "target_2":    sig.get("target_2", ""),
-                "invalidate":  sig.get("invalidate", ""),
+                "timestamp":      datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+                "signal_type":    sig.get("signal_type", ""),
+                "trigger":        sig.get("trigger", ""),
+                "score":          sig.get("score", ""),
+                "quality":        sig.get("quality", ""),
+                "regime":         sig.get("regime", ""),
+                "session":        sig.get("session", ""),
+                "bias":           sig.get("bias", ""),
+                "spot":           sig.get("spot", ""),
+                "vwap":           sig.get("vwap", ""),
+                "momentum":       sig.get("momentum", ""),
+                "atr":            sig.get("atr", ""),
+                "level":          sig.get("level", ""),
+                "target_1":       sig.get("target_1", ""),
+                "target_2":       sig.get("target_2", ""),
+                "invalidate":     sig.get("invalidate", ""),
+                "trade_type":                 sig.get("trade_type", ""),
+                "counter_trend":              sig.get("counter_trend", ""),
+                "structure_bias":             sig.get("structure_bias", ""),
+                "momentum_threshold_numeric": sig.get("momentum_threshold_numeric", ""),
+                "filter_context":             sig.get("filter_context", ""),
             })
     except Exception as e:
         print(f"[WARN] Signal log failed: {e}")
@@ -691,6 +747,7 @@ def format_signal_message(sig, alert_count, max_alerts):
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"*Quality:*  {badge} (score: {sig['score']})\n"
         f"*Regime:*   {regime_str} | {sig['session']}\n"
+        f"*Type:*     {sig.get('trade_type', type_label)}\n"
         f"*Trigger:*  {sig['trigger']}\n"
         f"*Time:*     {t}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -707,7 +764,10 @@ def format_signal_message(sig, alert_count, max_alerts):
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Alert {alert_count}/{max_alerts}"
     )
-    # Append daily level context if loaded
+    # Counter-trend warning (improvement 1)
+    if sig.get("counter_trend") and sig.get("structure_bias"):
+        msg += f"\n\n\u26a0\ufe0f *COUNTER-TREND vs STRUCTURE*\nStructure Bias: {sig['structure_bias']} | Signal: {sig['bias']}"
+    # Append daily level context
     if _LEVELS_LOADED:
         try:
             level_ctx = get_alert_context(sig["spot"])
