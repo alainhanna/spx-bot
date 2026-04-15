@@ -1109,21 +1109,27 @@ def main():
                 if len(closed_bars) < 20:
                     print(f"  -> Warming up ({len(closed_bars)}/20 closed bars)")
                 else:
-                    sig = evaluate_signal(
-                        closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
-                        last_signal_time, last_signal_price, last_signal_bias, or_set
-                    )
-                    if sig:
-                        alert_count      += 1
-                        last_signal_time  = now_et
-                        last_signal_price = sig["spot"]
-                        last_signal_bias  = sig["bias"]
-                        msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
-                        send_telegram(msg)
-                        log_signal(sig)
-                        print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
+                    # Bad tick guard — skip if last bar move is unrealistic vs prior ATR
+                    prior_atr  = calc_atr(closed_bars[:-1])
+                    last_move  = abs(closed_bars[-1]["c"] - closed_bars[-2]["c"])
+                    if last_move > prior_atr * 2.5:
+                        print(f"[WARN] Abnormal bar move ({last_move:.1f}pts vs ATR {prior_atr:.1f}) — skipping signal evaluation")
                     else:
-                        print(f"  -> No signal this bar")
+                        sig = evaluate_signal(
+                            closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
+                            last_signal_time, last_signal_price, last_signal_bias, or_set
+                        )
+                        if sig:
+                            alert_count      += 1
+                            last_signal_time  = now_et
+                            last_signal_price = sig["spot"]
+                            last_signal_bias  = sig["bias"]
+                            msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
+                            send_telegram(msg)
+                            log_signal(sig)
+                            print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
+                        else:
+                            print(f"  -> No signal this bar")
             elif not new_bar:
                 print(f"  -> Same bar - skipping")
 
