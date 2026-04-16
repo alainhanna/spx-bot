@@ -575,7 +575,8 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
 # COMBINED EVALUATOR
 # ─────────────────────────────────────────
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
-                    last_signal_time, last_signal_price, last_signal_bias, or_set):
+                    last_signal_time, last_signal_price, last_signal_bias, or_set,
+                    bearish_ct_count=None):
     now_et = datetime.datetime.now(ET)
 
     if last_signal_time:
@@ -640,26 +641,40 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
             pivot = DAILY_LEVELS["bull_bear_pivot"]
             r1    = DAILY_LEVELS["R1"]
             r2    = DAILY_LEVELS["R2"]
-            if signal_long:
-                # Bullish signal — full state ladder
-                if price > r2:
-                    structure_state = "STRONG TREND"
-                elif price > r1:
-                    structure_state = "TREND CONTINUATION"
-                elif price > pivot:
-                    structure_state = "NORMAL"
-                else:
-                    structure_state = "BELOW PIVOT"
+            if price > r2:
+                structure_state = "STRONG TREND"
+            elif price > r1:
+                structure_state = "TREND CONTINUATION"
+            elif price > pivot:
+                structure_state = "NORMAL"
             else:
-                # Bearish signal — simplified two-state
-                if price <= pivot:
-                    structure_state = "BELOW PIVOT"
-                else:
-                    structure_state = "ABOVE PIVOT"
+                structure_state = "BELOW PIVOT"
         except Exception:
             structure_state = "NORMAL"
     best["structure_state"] = structure_state
     print(f"  -> Structure state: {structure_state}")
+
+    # ── Bearish CT suppression rules (bullish tape protection) ──
+    if counter_trend and best["bias"] == "BEAR" and best.get("signal_type") == "MOMENTUM":
+        spot  = best["spot"]
+        below_vwap = (vwap is not None) and (spot < vwap)
+
+        # Rule 1: In STRONG TREND or TREND CONTINUATION, require price below VWAP
+        if structure_state in ("STRONG TREND", "TREND CONTINUATION"):
+            if not below_vwap:
+                print(f"  -> Bearish CT blocked: {structure_state} but price above VWAP")
+                return None
+
+        # Rule 2: If bias is LONG, require price below VWAP for any bearish CT signal
+        if structure_bias == "LONG" and not below_vwap:
+            print(f"  -> Bearish CT blocked: bias LONG but price above VWAP")
+            return None
+
+        # Rule 3: Max 2 bearish CT signals per session while structure is LONG
+        if structure_bias == "LONG" and bearish_ct_count is not None:
+            if bearish_ct_count.get(session, 0) >= 2:
+                print(f"  -> Bearish CT blocked: max 2 per session reached ({session})")
+                return None
 
     # ── Improvement 2: Higher score required for counter-trend momentum ──
     if counter_trend and best.get("signal_type") == "MOMENTUM":
@@ -808,9 +823,7 @@ def format_signal_message(sig, alert_count, max_alerts):
         elif state == "TREND CONTINUATION":
             state_str = f"TREND CONTINUATION above R1 ({r1})"
         elif state == "BELOW PIVOT":
-            state_str = f"BELOW PIVOT ({pivot}) — short bias"
-        elif state == "ABOVE PIVOT":
-            state_str = f"ABOVE PIVOT ({pivot}) — short signal"
+            state_str = f"BELOW PIVOT ({pivot})"
         else:
             state_str = f"NORMAL — above pivot ({pivot}), below R1 ({r1})"
         msg += f"\n*STRUCTURE:* {state_str}"
@@ -932,6 +945,7 @@ def main():
     or_set            = False
     vwap_history      = []
     last_bar_time     = None
+    bearish_ct_count  = {"MORNING": 0, "MIDDAY": 0, "AFTERNOON": 0}
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -956,6 +970,7 @@ def main():
             or_set            = False
             vwap_history      = []
             last_bar_time     = None
+            bearish_ct_count  = {"MORNING": 0, "MIDDAY": 0, "AFTERNOON": 0}
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day - reset.")
             if _LEVELS_LOADED:
                 print("[LEVELS] daily_levels.py active — structural context will enrich alerts")
@@ -1117,7 +1132,8 @@ def main():
                     else:
                         sig = evaluate_signal(
                             closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
-                            last_signal_time, last_signal_price, last_signal_bias, or_set
+                            last_signal_time, last_signal_price, last_signal_bias, or_set,
+                            bearish_ct_count
                         )
                         if sig:
                             alert_count      += 1
@@ -1127,6 +1143,10 @@ def main():
                             msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
                             send_telegram(msg)
                             log_signal(sig)
+                            # Increment bearish CT counter only after alert is sent
+                            if sig.get("counter_trend") and sig["bias"] == "BEAR":
+                                bearish_ct_count[session] = bearish_ct_count.get(session, 0) + 1
+                                print(f"  -> Bearish CT count [{session}]: {bearish_ct_count[session]}/2")
                             print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
                         else:
                             print(f"  -> No signal this bar")
