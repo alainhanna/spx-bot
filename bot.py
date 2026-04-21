@@ -8,17 +8,6 @@ import queue
 import csv
 from flask import Flask
 
-# Daily levels context (optional — bot runs normally if file missing)
-try:
-    from daily_levels import get_alert_context, get_bias, DAILY_LEVELS
-    _LEVELS_LOADED = True
-    print("[LEVELS] daily_levels.py loaded successfully")
-except ImportError:
-    _LEVELS_LOADED = False
-    get_bias = None
-    DAILY_LEVELS = {}
-    print("[LEVELS] daily_levels.py not found — running without level context")
-
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
@@ -38,10 +27,10 @@ COOLDOWN_MINUTES   = 2
 MAX_ALERTS_PER_DAY = 20
 
 # Momentum engine thresholds
-MOMENTUM_3BAR_MIN            = 4.0
-MOMENTUM_5BAR_MIN            = 6.0
-MOMENTUM_3BAR_MIN_MIDDAY     = 2.5
-MOMENTUM_5BAR_MIN_MIDDAY     = 4.0
+MOMENTUM_3BAR_MIN            = 3.0
+MOMENTUM_5BAR_MIN            = 4.5
+MOMENTUM_3BAR_MIN_MIDDAY     = 2.0
+MOMENTUM_5BAR_MIN_MIDDAY     = 3.5
 MOMENTUM_3BAR_MIN_AFTNOON    = 2.0
 MOMENTUM_5BAR_MIN_AFTNOON    = 3.0
 MOMENTUM_BAR_RANGE_EXPANSION = 1.2
@@ -56,7 +45,7 @@ RETEST_LOOKBACK             = 12
 BREAKOUT_MIN_MOMENTUM       = 3.0
 
 # Shared
-MIN_SIGNAL_DISTANCE = 6.0
+MIN_SIGNAL_DISTANCE = 4.0
 
 ET = pytz.timezone("America/New_York")
 
@@ -316,13 +305,13 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session):
     regime = get_regime(vix)
 
     if session == "MORNING":
-        min3, min5, min_score = MOMENTUM_3BAR_MIN, MOMENTUM_5BAR_MIN, 8
+        min3, min5, min_score = MOMENTUM_3BAR_MIN, MOMENTUM_5BAR_MIN, 7
     elif session == "MIDDAY":
-        min3, min5, min_score = MOMENTUM_3BAR_MIN_MIDDAY, MOMENTUM_5BAR_MIN_MIDDAY, 7
+        min3, min5, min_score = MOMENTUM_3BAR_MIN_MIDDAY, MOMENTUM_5BAR_MIN_MIDDAY, 6
     else:
-        min3, min5, min_score = MOMENTUM_3BAR_MIN_AFTNOON, MOMENTUM_5BAR_MIN_AFTNOON, 6
+        min3, min5, min_score = MOMENTUM_3BAR_MIN_AFTNOON, MOMENTUM_5BAR_MIN_AFTNOON, 5
 
-    momentum_volatility_floor = atr * 0.6
+    momentum_volatility_floor = atr * 0.35
     if mom3 >= max(min3, momentum_volatility_floor):
         direction = "BULL"
     elif mom3 <= -max(min3, momentum_volatility_floor):
@@ -350,8 +339,8 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session):
     avg_range    = sum(b["h"] - b["l"] for b in bars[-5:-1]) / 4 if len(bars) >= 5 else latest_range
 
     # Minimum bar size filter — reject low-energy candles relative to ATR
-    if latest_range < atr * 0.35:
-        print(f"  [MOM] Rejected: bar range {latest_range:.1f} < ATR*0.35 ({atr * 0.35:.1f})")
+    if latest_range < atr * 0.20:
+        print(f"  [MOM] Rejected: bar range {latest_range:.1f} < ATR*0.20 ({atr * 0.20:.1f})")
         return None
 
     if avg_range > 0 and latest_range >= avg_range * MOMENTUM_BAR_RANGE_EXPANSION:
@@ -377,7 +366,7 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session):
 
     # VWAP slope
     vwap_slope = calc_vwap_slope(vwap_history, n=5)
-    if (direction == "BULL" and vwap_slope > 0.5) or (direction == "BEAR" and vwap_slope < -0.5):
+    if (direction == "BULL" and vwap_slope > 0.15) or (direction == "BEAR" and vwap_slope < -0.15):
         score += 2
         reasons.append(f"VWAP slope {vwap_slope:+.2f}")
 
@@ -575,8 +564,7 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
 # COMBINED EVALUATOR
 # ─────────────────────────────────────────
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
-                    last_signal_time, last_signal_price, last_signal_bias, or_set,
-                    bearish_ct_count=None):
+                    last_signal_time, last_signal_price, last_signal_bias, or_set):
     now_et = datetime.datetime.now(ET)
 
     if last_signal_time:
@@ -606,97 +594,6 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
         print(f"  -> OR suppressed in AFTERNOON")
         return None
 
-    # ── Improvements 1 & 5: Structure bias + trade type classification ──
-    structure_bias = None
-    if _LEVELS_LOADED:
-        try:
-            structure_bias = get_bias(best["spot"]).upper()  # "LONG" or "SHORT"
-        except Exception:
-            structure_bias = None
-
-    signal_long   = (best["bias"] == "BULL")
-    structure_long = (structure_bias == "LONG") if structure_bias else None
-
-    if best.get("signal_type") == "BREAKOUT":
-        trade_type = "BREAKOUT"
-    elif best.get("signal_type") == "BREAKDOWN":
-        trade_type = "BREAKDOWN"
-    elif structure_long is None:
-        trade_type = "MOMENTUM"
-    elif signal_long == structure_long:
-        trade_type = "TREND_CONTINUATION"
-    else:
-        trade_type = "COUNTER_TREND_PULLBACK"
-
-    counter_trend = (trade_type == "COUNTER_TREND_PULLBACK")
-    best["trade_type"]     = trade_type
-    best["counter_trend"]  = counter_trend
-    best["structure_bias"] = structure_bias
-
-    # ── Structural trend state (classification only — no gating) ──
-    structure_state = "NORMAL"
-    if _LEVELS_LOADED:
-        try:
-            price = best["spot"]
-            pivot = DAILY_LEVELS["bull_bear_pivot"]
-            r1    = DAILY_LEVELS["R1"]
-            r2    = DAILY_LEVELS["R2"]
-            if price > r2:
-                structure_state = "STRONG TREND"
-            elif price > r1:
-                structure_state = "TREND CONTINUATION"
-            elif price > pivot:
-                structure_state = "NORMAL"
-            else:
-                structure_state = "BELOW PIVOT"
-        except Exception:
-            structure_state = "NORMAL"
-    best["structure_state"] = structure_state
-    print(f"  -> Structure state: {structure_state}")
-
-    # ── Bearish CT suppression rules (bullish tape protection) ──
-    if counter_trend and best["bias"] == "BEAR" and best.get("signal_type") == "MOMENTUM":
-        spot  = best["spot"]
-        below_vwap = (vwap is not None) and (spot < vwap)
-
-        # Rule 1: In STRONG TREND or TREND CONTINUATION, require price below VWAP
-        if structure_state in ("STRONG TREND", "TREND CONTINUATION"):
-            if not below_vwap:
-                print(f"  -> Bearish CT blocked: {structure_state} but price above VWAP")
-                return None
-
-        # Rule 2: If bias is LONG, require price below VWAP for any bearish CT signal
-        if structure_bias == "LONG" and not below_vwap:
-            print(f"  -> Bearish CT blocked: bias LONG but price above VWAP")
-            return None
-
-        # Rule 3: Max 2 bearish CT signals per session while structure is LONG
-        if structure_bias == "LONG" and bearish_ct_count is not None:
-            if bearish_ct_count.get(session, 0) >= 2:
-                print(f"  -> Bearish CT blocked: max 2 per session reached ({session})")
-                return None
-
-    # ── Improvement 2: Higher score required for counter-trend momentum ──
-    if counter_trend and best.get("signal_type") == "MOMENTUM":
-        base_min = {"MORNING": 8, "MIDDAY": 7, "AFTERNOON": 6}.get(session, 7)
-        min_score_ct = base_min + 2
-        if best["score"] < min_score_ct:
-            print(f"  -> Counter-trend filter blocked (score={best['score']} < {min_score_ct})")
-            return None
-        best["momentum_threshold_numeric"] = min_score_ct
-        best["filter_context"]             = "COUNTER_TREND_PLUS_2"
-    else:
-        base_min = {"MORNING": 8, "MIDDAY": 7, "AFTERNOON": 6}.get(session, 7)
-        best["momentum_threshold_numeric"] = base_min
-        best["filter_context"]             = "BASE"
-
-    # ── Improvement 3: After 14:30 only STRONG signals pass ──
-    if now_et.time() >= datetime.time(14, 30):
-        if best["quality"] != "STRONG":
-            print(f"  -> Late-day filter blocked (quality={best['quality']}, STRONG required after 14:30)")
-            return None
-        best["filter_context"] = "LATE_DAY_STRONG_ONLY"
-
     return best
 
 # ─────────────────────────────────────────
@@ -705,9 +602,7 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
 SIGNAL_LOG_FILE   = "signal_log.csv"
 SIGNAL_LOG_FIELDS = [
     "timestamp", "signal_type", "trigger", "score", "quality", "regime", "session",
-    "bias", "spot", "vwap", "momentum", "atr", "level", "target_1", "target_2", "invalidate",
-    "trade_type", "counter_trend", "structure_bias",
-    "momentum_threshold_numeric", "filter_context"
+    "bias", "spot", "vwap", "momentum", "atr", "level", "target_1", "target_2", "invalidate"
 ]
 
 def log_signal(sig):
@@ -718,27 +613,22 @@ def log_signal(sig):
             if write_header:
                 writer.writeheader()
             writer.writerow({
-                "timestamp":      datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
-                "signal_type":    sig.get("signal_type", ""),
-                "trigger":        sig.get("trigger", ""),
-                "score":          sig.get("score", ""),
-                "quality":        sig.get("quality", ""),
-                "regime":         sig.get("regime", ""),
-                "session":        sig.get("session", ""),
-                "bias":           sig.get("bias", ""),
-                "spot":           sig.get("spot", ""),
-                "vwap":           sig.get("vwap", ""),
-                "momentum":       sig.get("momentum", ""),
-                "atr":            sig.get("atr", ""),
-                "level":          sig.get("level", ""),
-                "target_1":       sig.get("target_1", ""),
-                "target_2":       sig.get("target_2", ""),
-                "invalidate":     sig.get("invalidate", ""),
-                "trade_type":                 sig.get("trade_type", ""),
-                "counter_trend":              sig.get("counter_trend", ""),
-                "structure_bias":             sig.get("structure_bias", ""),
-                "momentum_threshold_numeric": sig.get("momentum_threshold_numeric", ""),
-                "filter_context":             sig.get("filter_context", ""),
+                "timestamp":   datetime.datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET"),
+                "signal_type": sig.get("signal_type", ""),
+                "trigger":     sig.get("trigger", ""),
+                "score":       sig.get("score", ""),
+                "quality":     sig.get("quality", ""),
+                "regime":      sig.get("regime", ""),
+                "session":     sig.get("session", ""),
+                "bias":        sig.get("bias", ""),
+                "spot":        sig.get("spot", ""),
+                "vwap":        sig.get("vwap", ""),
+                "momentum":    sig.get("momentum", ""),
+                "atr":         sig.get("atr", ""),
+                "level":       sig.get("level", ""),
+                "target_1":    sig.get("target_1", ""),
+                "target_2":    sig.get("target_2", ""),
+                "invalidate":  sig.get("invalidate", ""),
             })
     except Exception as e:
         print(f"[WARN] Signal log failed: {e}")
@@ -792,7 +682,6 @@ def format_signal_message(sig, alert_count, max_alerts):
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"*Quality:*  {badge} (score: {sig['score']})\n"
         f"*Regime:*   {regime_str} | {sig['session']}\n"
-        f"*Type:*     {sig.get('trade_type', type_label)}\n"
         f"*Trigger:*  {sig['trigger']}\n"
         f"*Time:*     {t}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -809,60 +698,6 @@ def format_signal_message(sig, alert_count, max_alerts):
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Alert {alert_count}/{max_alerts}"
     )
-    # Counter-trend warning (improvement 1)
-    if sig.get("counter_trend") and sig.get("structure_bias"):
-        msg += f"\n\n\u26a0\ufe0f *COUNTER-TREND vs STRUCTURE*\nStructure Bias: {sig['structure_bias']} | Signal: {sig['bias']}"
-    # Structure state line
-    state = sig.get("structure_state")
-    if state:
-        pivot = DAILY_LEVELS.get("bull_bear_pivot", "")
-        r1    = DAILY_LEVELS.get("R1", "")
-        r2    = DAILY_LEVELS.get("R2", "")
-        if state == "STRONG TREND":
-            state_str = f"STRONG TREND above R2 ({r2})"
-        elif state == "TREND CONTINUATION":
-            state_str = f"TREND CONTINUATION above R1 ({r1})"
-        elif state == "BELOW PIVOT":
-            state_str = f"BELOW PIVOT ({pivot})"
-        else:
-            state_str = f"NORMAL — above pivot ({pivot}), below R1 ({r1})"
-        msg += f"\n*STRUCTURE:* {state_str}"
-    # Level proximity note — informational only, no gating
-    if _LEVELS_LOADED:
-        try:
-            price = sig["spot"]
-            PROXIMITY_THRESHOLD = 8
-            proximity_levels = [
-                (DAILY_LEVELS.get("bull_bear_pivot"), "Pivot"),
-                (DAILY_LEVELS.get("R1"),              "R1 resistance"),
-                (DAILY_LEVELS.get("R2"),              "R2 resistance"),
-                (DAILY_LEVELS.get("R3"),              "R3 resistance"),
-                (DAILY_LEVELS.get("daily_1sd_upper"), "Daily 1SD Upper"),
-                (DAILY_LEVELS.get("daily_1sd_lower"), "Daily 1SD Lower"),
-                (DAILY_LEVELS.get("daily_2sd_upper"), "Daily 2SD Upper"),
-                (DAILY_LEVELS.get("daily_2sd_lower"), "Daily 2SD Lower"),
-                (DAILY_LEVELS.get("vwap_daily"),      "Daily VWAP"),
-            ]
-            nearest = None
-            nearest_dist = PROXIMITY_THRESHOLD + 1
-            for lvl, label in proximity_levels:
-                if lvl is None:
-                    continue
-                dist = abs(price - lvl)
-                if dist <= PROXIMITY_THRESHOLD and dist < nearest_dist:
-                    nearest_dist = dist
-                    nearest = label
-            if nearest:
-                msg += f"\n*LEVELS:* Near {nearest}"
-        except Exception:
-            pass
-    # Append daily level context
-    if _LEVELS_LOADED:
-        try:
-            level_ctx = get_alert_context(sig["spot"])
-            msg += f"\n\n*Market Structure:*\n{level_ctx}"
-        except Exception:
-            pass
     extras = sig.get("all_candidates", [])
     if extras:
         msg += "\n\n*Also triggered:*\n" + "\n".join(f"  + {s}" for s in extras)
@@ -945,7 +780,6 @@ def main():
     or_set            = False
     vwap_history      = []
     last_bar_time     = None
-    bearish_ct_count  = {"MORNING": 0, "MIDDAY": 0, "AFTERNOON": 0}
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -970,10 +804,7 @@ def main():
             or_set            = False
             vwap_history      = []
             last_bar_time     = None
-            bearish_ct_count  = {"MORNING": 0, "MIDDAY": 0, "AFTERNOON": 0}
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day - reset.")
-            if _LEVELS_LOADED:
-                print("[LEVELS] daily_levels.py active — structural context will enrich alerts")
 
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
             print(f"[{now_et.strftime('%H:%M ET')}] Building pre-market brief...")
@@ -981,11 +812,27 @@ def main():
             today_events = get_economic_events()
             prev         = get_prev_day_levels()
             if prev:
-                key_levels.update({
+                key_levels = {
                     "Prev Day High":  prev["pdh"],
                     "Prev Day Low":   prev["pdl"],
                     "Prev Day Close": prev["pdc"],
-                })
+                }
+
+            # ── Manual key levels for today Apr 21 2026 ──────────────────────
+            # Source: John's level map + SPX VWAP chart
+            key_levels["Daily Pivot 7110"]    = 7110.0   # Bull/Bear pivot — critical
+            key_levels["R1 7122"]             = 7122.0   # First resistance
+            key_levels["R2 7135"]             = 7135.0
+            key_levels["R3 7147"]             = 7147.0
+            key_levels["Daily 1SD Upper 7152"]= 7152.0   # Upside target
+            key_levels["S1 7097"]             = 7097.0   # First support
+            key_levels["S2 7085"]             = 7085.0
+            key_levels["Daily 1SD Lower 7066"]= 7066.0   # Bear target
+            key_levels["WTD VWAP 7109"]       = 7109.0   # Triple confluence w/ PDC + pivot
+            key_levels["Daily VWAP 7088"]     = 7088.0   # Key support if 7110 breaks
+            key_levels["Round 7100"]          = 7100.0
+            key_levels["Round 7200"]          = 7200.0
+            # ─────────────────────────────────────────────────────────────────
             bars_pm = get_spx_bars(limit=30)
             if bars_pm:
                 spot_pm     = bars_pm[-1]["c"]
@@ -1124,32 +971,21 @@ def main():
                 if len(closed_bars) < 20:
                     print(f"  -> Warming up ({len(closed_bars)}/20 closed bars)")
                 else:
-                    # Bad tick guard — skip if last bar move is unrealistic vs prior ATR
-                    prior_atr  = calc_atr(closed_bars[:-1])
-                    last_move  = abs(closed_bars[-1]["c"] - closed_bars[-2]["c"])
-                    if last_move > prior_atr * 2.5:
-                        print(f"[WARN] Abnormal bar move ({last_move:.1f}pts vs ATR {prior_atr:.1f}) — skipping signal evaluation")
+                    sig = evaluate_signal(
+                        closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
+                        last_signal_time, last_signal_price, last_signal_bias, or_set
+                    )
+                    if sig:
+                        alert_count      += 1
+                        last_signal_time  = now_et
+                        last_signal_price = sig["spot"]
+                        last_signal_bias  = sig["bias"]
+                        msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
+                        send_telegram(msg)
+                        log_signal(sig)
+                        print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
                     else:
-                        sig = evaluate_signal(
-                            closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
-                            last_signal_time, last_signal_price, last_signal_bias, or_set,
-                            bearish_ct_count
-                        )
-                        if sig:
-                            alert_count      += 1
-                            last_signal_time  = now_et
-                            last_signal_price = sig["spot"]
-                            last_signal_bias  = sig["bias"]
-                            msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
-                            send_telegram(msg)
-                            log_signal(sig)
-                            # Increment bearish CT counter only after alert is sent
-                            if sig.get("counter_trend") and sig["bias"] == "BEAR":
-                                bearish_ct_count[session] = bearish_ct_count.get(session, 0) + 1
-                                print(f"  -> Bearish CT count [{session}]: {bearish_ct_count[session]}/2")
-                            print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
-                        else:
-                            print(f"  -> No signal this bar")
+                        print(f"  -> No signal this bar")
             elif not new_bar:
                 print(f"  -> Same bar - skipping")
 
