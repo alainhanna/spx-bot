@@ -780,6 +780,7 @@ def main():
     or_set            = False
     vwap_history      = []
     last_bar_time     = None
+    levels_loaded     = False  # gate: signals disabled until levels.py loads successfully
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -804,6 +805,7 @@ def main():
             or_set            = False
             vwap_history      = []
             last_bar_time     = None
+            levels_loaded     = False
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day - reset.")
 
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
@@ -818,20 +820,23 @@ def main():
                     "Prev Day Close": prev["pdc"],
                 }
 
-            # ── Manual key levels for today Apr 21 2026 ──────────────────────
-            # Source: John's level map + SPX VWAP chart
-            key_levels["Daily Pivot 7110"]    = 7110.0   # Bull/Bear pivot — critical
-            key_levels["R1 7122"]             = 7122.0   # First resistance
-            key_levels["R2 7135"]             = 7135.0
-            key_levels["R3 7147"]             = 7147.0
-            key_levels["Daily 1SD Upper 7152"]= 7152.0   # Upside target
-            key_levels["S1 7097"]             = 7097.0   # First support
-            key_levels["S2 7085"]             = 7085.0
-            key_levels["Daily 1SD Lower 7066"]= 7066.0   # Bear target
-            key_levels["WTD VWAP 7109"]       = 7109.0   # Triple confluence w/ PDC + pivot
-            key_levels["Daily VWAP 7088"]     = 7088.0   # Key support if 7110 breaks
-            key_levels["Round 7100"]          = 7100.0
-            key_levels["Round 7200"]          = 7200.0
+            # ── Manual key levels — loaded from levels.py ─────────────────────
+            try:
+                import importlib, levels as lvl_mod
+                importlib.reload(lvl_mod)
+                for name, price in lvl_mod.MANUAL_LEVELS.items():
+                    key_levels[name] = price
+                levels_loaded = True
+                print(f"[LEVELS] {len(lvl_mod.MANUAL_LEVELS)} manual levels loaded from levels.py")
+            except Exception as e:
+                levels_loaded = False
+                print(f"[ERROR] levels.py failed to load: {e}")
+                send_telegram(
+                    f"\u26a0\ufe0f *LEVELS LOAD FAILURE*\n"
+                    f"levels.py could not be loaded: {str(e)[:100]}\n"
+                    f"Signal generation is DISABLED for this session.\n"
+                    f"Upload a valid levels.py and redeploy to re-enable."
+                )
             # ─────────────────────────────────────────────────────────────────
             bars_pm = get_spx_bars(limit=30)
             if bars_pm:
@@ -966,9 +971,11 @@ def main():
                 _telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
                 _telegram_thread.start()
 
-            # Signal eval: only on new completed bar, within entry window
+            # Signal eval: only on new completed bar, within entry window, with levels loaded
             if new_bar and now_et.time() <= datetime.time(15, 30):
-                if len(closed_bars) < 20:
+                if not levels_loaded:
+                    print(f"  -> Signal generation DISABLED — levels.py failed to load")
+                elif len(closed_bars) < 20:
                     print(f"  -> Warming up ({len(closed_bars)}/20 closed bars)")
                 else:
                     sig = evaluate_signal(
