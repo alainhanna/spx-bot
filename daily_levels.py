@@ -1,190 +1,150 @@
-# ============================================================
-# SPX DAILY LEVELS — Generated from John's charts
-# Date: April 16, 2026
-# Current Price at capture: ~7,038
-#
-# IMPORTANT: This file is CONTEXT ONLY.
-# It does not gate, suppress, or override signals.
-# Bias is always calculated dynamically from live price vs pivot.
-# Levels influence confidence commentary only.
-# ============================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# daily_levels.py  —  Friday, April 24, 2026
+# Source: Godzilla pre-market levels chart + SPX VWAPs chart
+# Role: CONTEXT ONLY — do not inject into key_levels or signal engine
+# ─────────────────────────────────────────────────────────────────────────────
 
 DAILY_LEVELS = {
 
-    # ── BULL/BEAR PIVOT ─────────────────────────────────────
-    "bull_bear_pivot": 7010,
+    # ── Gamma / Structure ─────────────────────────────────────────────────────
+    "gamma_flip":           6961,
 
-    # ── GAMMA FLIP ──────────────────────────────────────────
-    "gamma_flip": 6763,
+    # ── Standard Deviation Bands ──────────────────────────────────────────────
+    "daily_1sd_upper":      7161,
+    "daily_1sd_lower":      7056,
+    "daily_2sd_upper":      7213,
+    "daily_2sd_lower":      7003,
 
-    # ── STANDARD DEVIATION BANDS ────────────────────────────
-    "daily_1sd_upper": 7066,
-    "daily_1sd_lower": 6975,
-    "daily_2sd_upper": 7109,
-    "daily_2sd_lower": 6935,
-    "weekly_1sd_upper": 6940,
-    "weekly_1sd_lower": 6693,  # scale-estimated
-    "weekly_2sd_upper": 7063,
-    "weekly_2sd_lower": 6250,
-    "monthly_1sd_upper": 6905,
-    "monthly_2sd_upper": 7300,
+    "weekly_1sd_upper":     7235,
+    "weekly_1sd_lower":     7017,
+    "weekly_2sd_upper":     7344,
+    "weekly_2sd_lower":     6908,
 
-    # ── YEARLY LEVELS ───────────────────────────────────────
-    "yearly_1sd_upper": 8007,
-    "yearly_2sd_upper": 9169,
-    "yearly_1sd_lower": 5684,
-    "yearly_2sd_lower": 4522,
+    "monthly_1sd_upper":    6905,
+    "monthly_2sd_upper":    7300,
+    "monthly_1sd_lower":    6152,
 
-    # ── QUARTERLY LEVELS ────────────────────────────────────
-    "q2_upper": 7195,
-    "q2_lower": 5861,
+    # ── Quarterly Levels ──────────────────────────────────────────────────────
+    "q2_upper":             7195,
+    "q2_lower":             5861,
 
-    # ── PIVOT POINTS (Classic R/S) ──────────────────────────
-    "R3": 7081,
-    "R2": 7053,
-    "R1": 7038,
-    "S1": 6995,
-    "S2": 6967,
-    "S3": 6952,
+    # ── Yearly Levels ─────────────────────────────────────────────────────────
+    "yearly_1sd_upper":     8007,
+    "yearly_2sd_upper":     9169,
+    "yearly_1sd_lower":     5684,
+    "yearly_2sd_lower":     4522,
 
-    # ── MOVING AVERAGES ─────────────────────────────────────
+    # ── Moving Averages ───────────────────────────────────────────────────────
     "dma": {
-        5:   6903,
-        20:  6641,
-        50:  6754,
-        100: 6813,
-        200: 6677,
+        5:   7108,
+        20:  6805,
+        50:  6777,
+        100: 6836,
+        200: 6703,
     },
 
-    # ── REFERENCE / CLOSING PRICES ──────────────────────────
-    "close_2025": 6845,
+    # ── VWAPs ─────────────────────────────────────────────────────────────────
+    "vwap": {
+        "WTD":          7111.25,
+        "ATH":          7108.41,
+        "Daily_1":      7107.81,
+        "Daily_2":      7107.11,
+        "MTD":          6888.95,
+        "YTD_Low":      6842.47,
+        "YTD":          6831.08,
+        "Aug_Low":      6743.13,
+        "May12_Gap":    6600.42,
+        "Apr2025_Low":  6488.59,
+        "VWAP_2025":    6351.84,
+    },
 
-    # ── GEX LEVELS (MenthorQ — Apr 16 expiration) ───────────
-    "gex_call_resistance_0dte": 7060,
-    "gex_put_support_0dte":     6840,
-    "gex_hvl_0dte":             6855,
-    "gex_call_resistance_1dte": 7000,
-    "gex_put_support_1dte":     6950,
-
-    # ── VWAP LEVELS (SPX VWAPs chart) ───────────────────────
-    "vwap_daily":  6937.66,
-    "vwap_wtd":    6910.58,
-    "vwap_level3": 6979.38,
-    "ath":         7022.96,
-
-    # ── KEY PRICE LADDER (SPX VWAPs chart) ──────────────────
+    # ── Key Price Ladder ──────────────────────────────────────────────────────
     "key_price_ladder": {
-        "nov_low":        6815.38,
-        "ytd":            6810.83,
-        "mtd":            6758.33,
-        "aug_low":        6731.54,
-        "ytd_low":        6708.14,
-        "may_gap_up":     6587.94,
-        "april_2025_low": 6474.84,
-        "vwap_2025":      6338.45,
+        "ATH/WTD VWAP cluster":     7108,
+        "Daily 1SD Lower":          7056,
+        "Weekly 1SD Lower":         7017,
+        "Gamma Flip":               6961,
+        "Monthly 1SD Upper":        6905,
+        "MTD VWAP":                 6889,
+        "100 DMA":                  6836,
+        "20 DMA":                   6805,
+        "50 DMA":                   6777,
+        "200 DMA":                  6703,
+        "Daily 1SD Upper":          7161,
+        "Q2 Upper":                 7195,
+        "Daily 2SD Upper":          7213,
+        "Weekly 1SD Upper":         7235,
+        "Monthly 2SD Upper":        7300,
+        "Weekly 2SD Upper":         7344,
     },
 
-    # ── NEAREST RESISTANCE to ~7038 ─────────────────────────
-    "nearest_resistance": [
-        {"level": 7038,  "label": "R1"},
-        {"level": 7053,  "label": "R2"},
-        {"level": 7060,  "label": "GEX Call Resistance 0DTE"},
-        {"level": 7066,  "label": "Daily 1SD Upper"},
-        {"level": 7081,  "label": "R3"},
-        {"level": 7109,  "label": "Daily 2SD Upper"},
-        {"level": 7195,  "label": "Q2 Upper"},
-        {"level": 7300,  "label": "Monthly 2SD Upper"},
-    ],
-
-    # ── NEAREST SUPPORT to ~7038 ────────────────────────────
-    "nearest_support": [
-        {"level": 7022,  "label": "ATH"},
-        {"level": 7010,  "label": "Bull/Bear Pivot"},
-        {"level": 6995,  "label": "S1"},
-        {"level": 6979,  "label": "Daily VWAP L3"},
-        {"level": 6975,  "label": "Daily 1SD Lower"},
-        {"level": 6967,  "label": "S2"},
-        {"level": 6952,  "label": "S3"},
-        {"level": 6940,  "label": "Weekly 1SD Upper"},
-        {"level": 6938,  "label": "Daily VWAP"},
-        {"level": 6935,  "label": "Daily 2SD Lower"},
-        {"level": 6911,  "label": "WTD VWAP"},
-        {"level": 6903,  "label": "5 DMA"},
-        {"level": 6855,  "label": "GEX HVL 0DTE"},
-        {"level": 6845,  "label": "2025 Closing Price"},
-        {"level": 6840,  "label": "GEX Put Support 0DTE"},
-        {"level": 6813,  "label": "100 DMA"},
-        {"level": 6763,  "label": "Gamma Flip"},
-        {"level": 6754,  "label": "50 DMA"},
-        {"level": 6677,  "label": "200 DMA"},
-        {"level": 6693,  "label": "Weekly 1SD Lower"},
-        {"level": 6641,  "label": "20 DMA"},
-    ],
-
-    # ── SCENARIO MAP ────────────────────────────────────────
-    "scenarios": {
-        "bull": {
-            "condition": "Holds above Bull/Bear Pivot 7010",
-            "targets": [7038, 7053, 7060, 7066, 7081, 7109],
-            "description": "R1 -> R2 -> GEX Call Resistance -> Daily 1SD Upper -> R3 -> Daily 2SD Upper"
-        },
-        "bear": {
-            "condition": "Loses Bull/Bear Pivot 7010",
-            "targets": [6995, 6979, 6975, 6967, 6952, 6940],
-            "description": "S1 -> VWAP L3 -> Daily 1SD Lower -> S2 -> S3 -> Weekly 1SD Upper"
-        },
-        "chop": {
-            "range_low":  6975,
-            "range_high": 7066,
-            "description": "Inside daily 1SD band - no directional edge"
-        }
-    }
+    # ── Session Bias ─────────────────────────────────────────────────────────
+    "bias":     "BULLISH",
+    "bias_note": (
+        "Price coiling on ATH/WTD VWAP cluster (7108). 5 DMA at 7108. "
+        "Godzilla: Hidden gem — STRONG BUY. Ascending trendline support intact. "
+        "Hold 7108 -> 7161 Daily 1SD Upper. Lose 7108 -> 7056, then 7017. "
+        "Gamma Flip 6961 must hold for bull thesis."
+    ),
 }
 
 
-def get_bias(price):
-    return "long" if price > DAILY_LEVELS["bull_bear_pivot"] else "short"
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_bias(price: float) -> str:
+    gf   = DAILY_LEVELS["gamma_flip"]
+    d1l  = DAILY_LEVELS["daily_1sd_lower"]
+    d1u  = DAILY_LEVELS["daily_1sd_upper"]
+    vwap = DAILY_LEVELS["vwap"]["ATH"]
+
+    if price >= d1u:
+        return "EXTENDED BULLISH — near Daily 1SD Upper"
+    elif price >= vwap:
+        return "BULLISH — holding above ATH/WTD VWAP cluster"
+    elif price >= d1l:
+        return "CAUTIOUS BULLISH — between VWAP cluster and Daily 1SD Lower"
+    elif price >= gf:
+        return "BEARISH LEAN — below VWAP cluster, above Gamma Flip"
+    else:
+        return "BEARISH — below Gamma Flip (6961)"
 
 
-def distance_to_level(price, level):
-    return round(abs(price - level), 2)
+def distance_to_level(price: float, level_name: str) -> float:
+    ladder = DAILY_LEVELS["key_price_ladder"]
+    if level_name not in ladder:
+        raise KeyError(f"Level '{level_name}' not in key_price_ladder")
+    return round(ladder[level_name] - price, 1)
 
 
-def get_nearest_levels(price, n=3):
-    res = [(l["level"], l["label"]) for l in DAILY_LEVELS["nearest_resistance"] if l["level"] > price]
-    sup = [(l["level"], l["label"]) for l in DAILY_LEVELS["nearest_support"]   if l["level"] < price]
+def nearest_levels(price: float, n: int = 2):
+    ladder = DAILY_LEVELS["key_price_ladder"]
+    above = sorted([(v, k) for k, v in ladder.items() if v > price])[:n]
+    below = sorted([(v, k) for k, v in ladder.items() if v < price], reverse=True)[:n]
     return {
-        "resistance": sorted(res, key=lambda x: x[0])[:n],
-        "support":    sorted(sup, key=lambda x: x[0], reverse=True)[:n],
+        "resistance": [(k, v) for v, k in above],
+        "support":    [(k, v) for v, k in below],
     }
 
 
-def get_confidence_modifier(price):
-    d2u = DAILY_LEVELS["daily_2sd_upper"]
-    d2l = DAILY_LEVELS["daily_2sd_lower"]
-    d1u = DAILY_LEVELS["daily_1sd_upper"]
-    d1l = DAILY_LEVELS["daily_1sd_lower"]
-    if distance_to_level(price, d2u) <= 10 or distance_to_level(price, d2l) <= 10:
-        return {"modifier": "CAUTION", "note": "Near 2SD extension - elevated reversal risk"}
-    elif distance_to_level(price, d1u) <= 8:
-        return {"modifier": "WATCH", "note": f"Approaching Daily 1SD Upper {d1u} - resistance ahead"}
-    elif distance_to_level(price, d1l) <= 8:
-        return {"modifier": "WATCH", "note": f"Approaching Daily 1SD Lower {d1l} - support nearby"}
-    return {"modifier": "NORMAL", "note": ""}
+def get_alert_context(price: float) -> str:
+    bias = get_bias(price)
+    lvls = nearest_levels(price, n=1)
 
+    r_name, r_val = lvls["resistance"][0] if lvls["resistance"] else ("--", price)
+    s_name, s_val = lvls["support"][0]    if lvls["support"]    else ("--", price)
 
-def get_alert_context(price):
-    bias   = get_bias(price).upper()
-    pivot  = DAILY_LEVELS["bull_bear_pivot"]
-    levels = get_nearest_levels(price, n=1)
-    conf   = get_confidence_modifier(price)
-    r_entry = levels["resistance"][0] if levels["resistance"] else None
-    s_entry = levels["support"][0]    if levels["support"]    else None
-    r_level, r_label = (r_entry[0], r_entry[1]) if r_entry else (None, None)
-    s_level, s_label = (s_entry[0], s_entry[1]) if s_entry else (None, None)
-    r_str = f"{r_level} ({r_label}, {distance_to_level(price, r_level)}pts)" if r_level else "no resistance data"
-    s_str = f"{s_level} ({s_label}, {distance_to_level(price, s_level)}pts)" if s_level else "no support data"
-    context = f"Bias: {bias} | Pivot: {pivot} | R: {r_str} | S: {s_str}"
-    if conf["note"]:
-        context += f" | {conf['modifier']}: {conf['note']}"
-    return context
+    r_dist = round(r_val - price, 0)
+    s_dist = round(price - s_val, 0)
+
+    flag = ""
+    if price >= DAILY_LEVELS["daily_2sd_upper"] or price <= DAILY_LEVELS["daily_2sd_lower"]:
+        flag = " ⚠️ CAUTION: 2SD Extension"
+    elif price >= DAILY_LEVELS["daily_1sd_upper"] or price <= DAILY_LEVELS["daily_1sd_lower"]:
+        flag = " 👀 WATCH: 1SD Extension"
+
+    return (
+        f"Structure: {bias}{flag}\n"
+        f"R: {r_name} {r_val} (+{r_dist:.0f}pt) | S: {s_name} {s_val} (-{s_dist:.0f}pt)"
+    )
