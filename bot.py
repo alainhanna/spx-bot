@@ -38,7 +38,12 @@ MOMENTUM_CLOSE_STRENGTH_PCT  = 0.6
 MOMENTUM_MAX_OPPOSITE_BARS   = 1
 MOMENTUM_MAX_WICK_PCT        = 0.4
 
-# Breakout engine thresholds
+# Compression detection config
+COMPRESSION_RANGE_RATIO   = 0.60   # recent 5-bar avg range must be < 60% of prior 20-bar avg
+COMPRESSION_ATR_RATIO     = 0.50   # latest bar < 50% of ATR = compressed candle
+COMPRESSION_LEVEL_WINDOW  = 8.0    # pts — "coiling near a level" proximity
+COMPRESSION_MIN_RTH_BARS  = 25     # minimum RTH bars before compression is evaluated
+COMPRESSION_MAX_BONUS     = 4      # cap total compression score bonus
 BREAKOUT_FOLLOW_THROUGH_MIN = 2.0
 BREAKOUT_RETEST_WINDOW      = 8.0
 RETEST_LOOKBACK             = 12
@@ -290,7 +295,87 @@ def _wick_ok(bar, direction):
     else:
         return (bar["c"] - bar["l"]) / bar_range <= MOMENTUM_MAX_WICK_PCT
 
-def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session):
+def calc_compression_score(bars, atr, key_levels, now_et):
+    """
+    Detects pre-move compression (coiling) and returns a bonus score (0–4).
+    Only fires when:
+      - >= COMPRESSION_MIN_RTH_BARS RTH bars exist
+      - current time >= 9:45 ET (stable bar history)
+    Acts as an amplifier only — never fires a standalone signal.
+
+    Scoring:
+      +2  range contraction: avg of last 5 bars < 60% of avg of bars 6–20
+      +1  ATR contraction: latest bar range < ATR * 0.50
+      +2  coiling near a key level
+      +1  low directional variance: >= 3 direction changes in last 5 bars
+              AND 5-bar net move < ATR * 0.35 (confirming coil not trend)
+    Cap: +4 max. Pure range-only compression capped at +3 if not near a level.
+    """
+    # Session guards
+    if now_et.time() < datetime.time(9, 45):
+        return 0, []
+
+    rth_bars = [b for b in bars if b.get("t") and
+                datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+    if len(rth_bars) < COMPRESSION_MIN_RTH_BARS:
+        return 0, []
+
+    latest       = bars[-1]
+    latest_range = latest["h"] - latest["l"]
+    c_score      = 0
+    c_reasons    = []
+
+    # Condition 1: range contraction — last 5 vs prior 15 bars
+    if len(bars) >= 20:
+        avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
+        avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
+        range_contraction = avg_prior > 0 and avg_recent < avg_prior * COMPRESSION_RANGE_RATIO
+    else:
+        range_contraction = False
+
+    if range_contraction:
+        c_score += 2
+        c_reasons.append("range contraction")
+    else:
+        return 0, []
+
+    # Condition 2: ATR contraction on latest bar
+    atr_contraction = atr > 0 and latest_range < atr * COMPRESSION_ATR_RATIO
+    if atr_contraction:
+        c_score += 1
+        c_reasons.append("ATR contraction")
+
+    # Condition 3: coiling near a key level
+    spot = latest["c"]
+    coiling_near_level = any(
+        v is not None and abs(spot - v) <= COMPRESSION_LEVEL_WINDOW
+        for k, v in key_levels.items()
+    )
+    if coiling_near_level:
+        c_score += 2
+        c_reasons.append("near key level")
+
+    # Condition 4: low directional variance (coiling, not trending)
+    if len(bars) >= 5:
+        last5       = bars[-5:]
+        moves       = [last5[i]["c"] - last5[i-1]["c"] for i in range(1, len(last5))]
+        dir_changes = sum(1 for i in range(1, len(moves)) if moves[i] * moves[i-1] < 0)
+        net_move_5  = abs(last5[-1]["c"] - last5[0]["c"])
+        if dir_changes >= 3 and net_move_5 < atr * 0.35:
+            c_score += 1
+            c_reasons.append(f"coiling ({dir_changes} dir changes)")
+
+    # Audit point 1: cap pure range-only compression if not near a level
+    if not coiling_near_level and c_score > 3:
+        c_score = 3
+
+    # Global cap
+    c_score = min(c_score, COMPRESSION_MAX_BONUS)
+
+    return c_score, c_reasons
+
+
+def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session, key_levels=None, now_et=None):
     """
     Primary engine. Fires on impulse price moves regardless of key levels.
     Scoring up to ~17 points. Min score: MORNING=8, MIDDAY=7, AFTERNOON=6.
@@ -390,6 +475,15 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session):
         if (direction == "BULL" and mom3 > prior_mom3 > 0) or (direction == "BEAR" and mom3 < prior_mom3 < 0):
             score += 2
             reasons.append(f"accelerating")
+
+    # Compression bonus — amplifier only, gated by session time and bar count
+    # Only adds when momentum threshold already met (direction is already confirmed above)
+    if key_levels and now_et:
+        c_bonus, c_reasons = calc_compression_score(bars, atr, key_levels, now_et)
+        if c_bonus > 0:
+            score += c_bonus
+            reasons.append(f"compression +{c_bonus} ({', '.join(c_reasons)})")
+            print(f"  [MOM] Compression bonus +{c_bonus}: {c_reasons}")
 
     print(f"  [MOM] dir={direction} score={score}/{min_score} | {reasons}")
 
@@ -566,12 +660,12 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
                     last_signal_time, last_signal_price, last_signal_bias, or_set):
     now_et = datetime.datetime.now(ET)
-
     if last_signal_time:
         if (now_et - last_signal_time).total_seconds() / 60 < COOLDOWN_MINUTES:
             return None
 
-    mom_sig = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session)
+    mom_sig = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
+                                        key_levels=key_levels, now_et=now_et)
     brk_sig = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
 
     if mom_sig and brk_sig:

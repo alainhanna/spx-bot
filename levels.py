@@ -1,14 +1,26 @@
+# ─────────────────────────────────────────
+# levels.py — SPX key levels for today
+# Update this file each morning and upload to GitHub
+# bot.py imports MANUAL_LEVELS automatically
+# ─────────────────────────────────────────
+
+# Date: April 27, 2026
+# Source: Godzilla Trader / GT level map
+
 MANUAL_LEVELS = {
-    "Daily 1SD Upper":          7161,
-    "Daily 1SD Lower":          7056,
-    "Daily 2SD Upper":          7213,
-    "Daily 2SD Lower":          7003,
-    "Weekly 1SD Upper":         7235,
-    "Weekly 1SD Lower":         7017,
-    "Gamma Flip":               6961,
-    "Monthly 1SD Upper":        6905,
-    "ATH/WTD VWAP cluster":     7108,
-    "MTD VWAP":                 6889,
-    "100 DMA":                  6836,
-    "200 DMA":                  6703,
+    # GEX levels (0DTE expiration Apr 27)
+    "Call Wall 7130":        7130.0,   # GEX call resistance — key ceiling
+    "HVL 7095":              7095.0,   # High volume level — magnet/pivot
+    "Put Support 7055":      7055.0,   # GEX put floor
+
+    # VWAP cluster
+    "ATH VWAP 7165":         7165.07,  # ATH VWAP — upper target if 7130 breaks
+    "VWAP 7139":             7139.96,  # Prior session VWAP
+    "VWAP 7130":             7130.06,  # Key orange VWAP confluence w/ call wall
+    "VWAP 7119":             7119.06,  # Lower session VWAP — bear/bull dividing line
+
+    # Round numbers
+    "Round 7100":            7100.0,
+    "Round 7200":            7200.0,
 }
+
