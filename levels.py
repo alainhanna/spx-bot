@@ -20,11 +20,9 @@ MANUAL_LEVELS = {
     "Weekly 1SD Lower 7035":   7035.0,   # Weekly lower
     "5 DMA 7117":              7117.0,   # 5-day moving average
 
-    # VWAP cluster
+    # VWAP cluster — top 2 only, avoid compression bonus inflation
     "ATH VWAP 7165":           7165.07,  # ATH VWAP — upper target
     "VWAP 7139":               7139.96,  # Prior session VWAP
-    "VWAP 7130":               7130.06,  # Key VWAP confluence w/ call wall
-    "VWAP 7119":               7119.06,  # Lower session VWAP
 
     # Gamma flip
     "Gamma Flip 6950":         6950.0,   # Major structural level
