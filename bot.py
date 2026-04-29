@@ -24,7 +24,6 @@ if not TELEGRAM_CHAT_ID:
 
 POLL_INTERVAL_SEC  = 15
 COOLDOWN_MINUTES   = 2
-MAX_ALERTS_PER_DAY = 20
 
 # Momentum engine thresholds
 MOMENTUM_3BAR_MIN            = 3.0
@@ -39,15 +38,19 @@ MOMENTUM_MAX_OPPOSITE_BARS   = 1
 MOMENTUM_MAX_WICK_PCT        = 0.4
 
 # Compression detection config
-COMPRESSION_RANGE_RATIO   = 0.60   # recent 5-bar avg range must be < 60% of prior 20-bar avg
-COMPRESSION_ATR_RATIO     = 0.50   # latest bar < 50% of ATR = compressed candle
-COMPRESSION_LEVEL_WINDOW  = 8.0    # pts — "coiling near a level" proximity
-COMPRESSION_MIN_RTH_BARS  = 25     # minimum RTH bars before compression is evaluated
-COMPRESSION_MAX_BONUS     = 4      # cap total compression score bonus
+COMPRESSION_RANGE_RATIO   = 0.60
+COMPRESSION_ATR_RATIO     = 0.50
+COMPRESSION_LEVEL_WINDOW  = 8.0
+COMPRESSION_MIN_RTH_BARS  = 25
+COMPRESSION_MAX_BONUS     = 4
 BREAKOUT_FOLLOW_THROUGH_MIN = 2.0
 BREAKOUT_RETEST_WINDOW      = 8.0
 RETEST_LOOKBACK             = 12
 BREAKOUT_MIN_MOMENTUM       = 3.0
+
+# Trap engine config
+TRAP_MAX_BARS   = 3     # max bars after break for failure to complete
+TRAP_BASE_SCORE = 10    # base score — higher conviction than standard breakout
 
 # Shared
 MIN_SIGNAL_DISTANCE = 4.0
@@ -102,7 +105,7 @@ def get_spx_bars(limit=80):
             data    = r.json()
             results = data.get("results", [])
             if results:
-                results = list(reversed(results))  # desc → chronological order
+                results = list(reversed(results))
                 print(f"[POLYGON] {len(results)} latest bars fetched")
                 return results
             else:
@@ -297,55 +300,33 @@ def _wick_ok(bar, direction):
 
 def calc_compression_score(bars, atr, key_levels, now_et):
     """
-    Detects pre-move compression (coiling) and returns a bonus score (0–4).
-    Only fires when:
-      - >= COMPRESSION_MIN_RTH_BARS RTH bars exist
-      - current time >= 9:45 ET (stable bar history)
-    Acts as an amplifier only — never fires a standalone signal.
-
-    Scoring:
-      +2  range contraction: avg of last 5 bars < 60% of avg of bars 6–20
-      +1  ATR contraction: latest bar range < ATR * 0.50
-      +2  coiling near a key level
-      +1  low directional variance: >= 3 direction changes in last 5 bars
-              AND 5-bar net move < ATR * 0.35 (confirming coil not trend)
-    Cap: +4 max. Pure range-only compression capped at +3 if not near a level.
+    Detects pre-move compression (coiling) and returns a bonus score (0-4).
+    Range contraction is mandatory gate. Amplifier only.
     """
-    # Session guards
     if now_et.time() < datetime.time(9, 45):
         return 0, []
-
     rth_bars = [b for b in bars if b.get("t") and
                 datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
     if len(rth_bars) < COMPRESSION_MIN_RTH_BARS:
         return 0, []
-
     latest       = bars[-1]
     latest_range = latest["h"] - latest["l"]
     c_score      = 0
     c_reasons    = []
-
-    # Condition 1: range contraction — last 5 vs prior 15 bars
     if len(bars) >= 20:
         avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
         avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
         range_contraction = avg_prior > 0 and avg_recent < avg_prior * COMPRESSION_RANGE_RATIO
     else:
         range_contraction = False
-
     if range_contraction:
         c_score += 2
         c_reasons.append("range contraction")
     else:
         return 0, []
-
-    # Condition 2: ATR contraction on latest bar
-    atr_contraction = atr > 0 and latest_range < atr * COMPRESSION_ATR_RATIO
-    if atr_contraction:
+    if atr > 0 and latest_range < atr * COMPRESSION_ATR_RATIO:
         c_score += 1
         c_reasons.append("ATR contraction")
-
-    # Condition 3: coiling near a key level
     spot = latest["c"]
     coiling_near_level = any(
         v is not None and abs(spot - v) <= COMPRESSION_LEVEL_WINDOW
@@ -354,8 +335,6 @@ def calc_compression_score(bars, atr, key_levels, now_et):
     if coiling_near_level:
         c_score += 2
         c_reasons.append("near key level")
-
-    # Condition 4: low directional variance (coiling, not trending)
     if len(bars) >= 5:
         last5       = bars[-5:]
         moves       = [last5[i]["c"] - last5[i-1]["c"] for i in range(1, len(last5))]
@@ -364,38 +343,26 @@ def calc_compression_score(bars, atr, key_levels, now_et):
         if dir_changes >= 3 and net_move_5 < atr * 0.35:
             c_score += 1
             c_reasons.append(f"coiling ({dir_changes} dir changes)")
-
-    # Audit point 1: cap pure range-only compression if not near a level
     if not coiling_near_level and c_score > 3:
         c_score = 3
-
-    # Global cap
     c_score = min(c_score, COMPRESSION_MAX_BONUS)
-
     return c_score, c_reasons
 
-
 def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session, key_levels=None, now_et=None):
-    """
-    Primary engine. Fires on impulse price moves regardless of key levels.
-    Scoring up to ~17 points. Min score: MORNING=8, MIDDAY=7, AFTERNOON=6.
-    """
+    """Primary engine. Fires on impulse price moves regardless of key levels."""
     if len(bars) < 6:
         return None
-
     spot   = bars[-1]["c"]
     mom3   = calc_momentum(bars, 3)
     mom5   = calc_momentum(bars, 5)
     atr    = calc_atr(bars)
     regime = get_regime(vix)
-
     if session == "MORNING":
         min3, min5, min_score = MOMENTUM_3BAR_MIN, MOMENTUM_5BAR_MIN, 7
     elif session == "MIDDAY":
         min3, min5, min_score = MOMENTUM_3BAR_MIN_MIDDAY, MOMENTUM_5BAR_MIN_MIDDAY, 6
     else:
         min3, min5, min_score = MOMENTUM_3BAR_MIN_AFTNOON, MOMENTUM_5BAR_MIN_AFTNOON, 5
-
     momentum_volatility_floor = atr * 0.35
     if mom3 >= max(min3, momentum_volatility_floor):
         direction = "BULL"
@@ -403,44 +370,30 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session, key_levels=
         direction = "BEAR"
     else:
         return None
-
     recent5 = bars[-5:]
     recent3 = bars[-3:]
     latest  = bars[-1]
     score   = 0
     reasons = []
-
-    # 3-bar impulse (always true here)
     score += 3
     reasons.append(f"3-bar {mom3:+.1f}pts")
-
-    # 5-bar impulse
     if (direction == "BULL" and mom5 >= min5) or (direction == "BEAR" and mom5 <= -min5):
         score += 2
         reasons.append(f"5-bar {mom5:+.1f}pts")
-
-    # Range expansion
     latest_range = latest["h"] - latest["l"]
     avg_range    = sum(b["h"] - b["l"] for b in bars[-5:-1]) / 4 if len(bars) >= 5 else latest_range
-
-    # Minimum bar size filter — reject low-energy candles relative to ATR
     if latest_range < atr * 0.20:
         print(f"  [MOM] Rejected: bar range {latest_range:.1f} < ATR*0.20 ({atr * 0.20:.1f})")
         return None
-
     if avg_range > 0 and latest_range >= avg_range * MOMENTUM_BAR_RANGE_EXPANSION:
         score += 2
-        reasons.append(f"range expansion")
-
-    # Close strength in last 3 bars
+        reasons.append("range expansion")
     strong_closes = sum(1 for b in recent3 if _close_strength(b, direction))
     if strong_closes >= 2:
         score += 2
         reasons.append(f"{strong_closes}/3 strong closes")
     elif strong_closes == 1:
         score += 1
-
-    # VWAP alignment
     above_vwap = vwap and spot > vwap
     below_vwap = vwap and spot < vwap
     if (direction == "BULL" and above_vwap) or (direction == "BEAR" and below_vwap):
@@ -448,14 +401,10 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session, key_levels=
         reasons.append("VWAP aligned")
     elif vwap is None:
         score += 1
-
-    # VWAP slope
     vwap_slope = calc_vwap_slope(vwap_history, n=5)
     if (direction == "BULL" and vwap_slope > 0.15) or (direction == "BEAR" and vwap_slope < -0.15):
         score += 2
         reasons.append(f"VWAP slope {vwap_slope:+.2f}")
-
-    # Clean sequence (few opposite-color bars)
     if direction == "BULL":
         opp = sum(1 for b in recent5 if b["c"] < b["o"])
     else:
@@ -463,36 +412,35 @@ def evaluate_momentum_signal(bars, vwap, vwap_history, vix, session, key_levels=
     if opp <= MOMENTUM_MAX_OPPOSITE_BARS:
         score += 1
         reasons.append(f"clean ({opp} opp bars)")
-
-    # Wick clean on latest bar
     if _wick_ok(latest, direction):
         score += 1
         reasons.append("wick ok")
-
-    # Acceleration bonus
     if len(bars) >= 7:
         prior_mom3 = bars[-4]["c"] - bars[-7]["c"]
         if (direction == "BULL" and mom3 > prior_mom3 > 0) or (direction == "BEAR" and mom3 < prior_mom3 < 0):
             score += 2
-            reasons.append(f"accelerating")
-
-    # Compression bonus — amplifier only, gated by session time and bar count
-    # Only adds when momentum threshold already met (direction is already confirmed above)
+            reasons.append("accelerating")
+    # Compression bonus + vol expansion (gated: expansion only fires after confirmed compression)
+    compression_present = False
     if key_levels and now_et:
         c_bonus, c_reasons = calc_compression_score(bars, atr, key_levels, now_et)
         if c_bonus > 0:
+            compression_present = True
             score += c_bonus
             reasons.append(f"compression +{c_bonus} ({', '.join(c_reasons)})")
             print(f"  [MOM] Compression bonus +{c_bonus}: {c_reasons}")
 
+    # Vol expansion only fires after genuine compression — not random spikes
+    if compression_present and len(bars) >= 20:
+        recent_avg_range = sum(b["h"] - b["l"] for b in bars[-20:-5]) / len(bars[-20:-5])
+        if latest_range > recent_avg_range * 1.4:
+            score += 2
+            reasons.append("vol expansion")
     print(f"  [MOM] dir={direction} score={score}/{min_score} | {reasons}")
-
     if score < min_score:
         return None
-
     quality = "STRONG" if score >= 13 else "HIGH" if score >= 9 else "MEDIUM"
     exits   = build_exit_params(session, regime, atr, direction, spot, vwap)
-
     return {
         "signal_type": "MOMENTUM",
         "trigger":     f"Momentum {direction} {mom3:+.1f}pts | {', '.join(reasons[:3])}",
@@ -525,30 +473,23 @@ def _bars_below(bars, level, n):
     return all(b["c"] < level for b in bars[-n:])
 
 def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
-    """
-    Secondary engine. Fires on confirmed key level breaks and retests.
-    OR levels suppressed until or_set=True.
-    """
+    """Secondary engine. Fires on confirmed key level breaks and retests."""
     if len(bars) < 5 or not key_levels:
         return None
-
     spot       = bars[-1]["c"]
     atr        = calc_atr(bars)
     regime     = get_regime(vix)
     above_vwap = vwap and spot > vwap
     below_vwap = vwap and spot < vwap
     mom3       = calc_momentum(bars, 3)
-
     if session == "MORNING":
         min_mom, confirm = BREAKOUT_MIN_MOMENTUM, 1
     elif session == "MIDDAY":
         min_mom, confirm = 2.5, 2
     else:
         min_mom, confirm = 2.0, 2
-
     candidates = []
     follow     = BREAKOUT_FOLLOW_THROUGH_MIN
-
     for level_name, level in key_levels.items():
         if level is None:
             continue
@@ -556,8 +497,6 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
             continue
         if level_name == "VWAP":
             continue
-
-        # BULL BREAKOUT
         if spot > level + follow and _bars_above(bars, level, confirm) and mom3 >= min_mom:
             score = 7
             if above_vwap:                        score += 2
@@ -571,8 +510,6 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
                 "level": level, "level_name": level_name, "score": score,
             })
             print(f"  [BRK] BULL {level_name} score={score}")
-
-        # BULL RETEST
         elif level < spot <= level + BREAKOUT_RETEST_WINDOW:
             was_above = any(b["c"] > level + follow for b in bars[-RETEST_LOOKBACK:-3])
             if was_above and mom3 >= 0 and above_vwap:
@@ -581,8 +518,6 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
                     "trigger": f"Retest hold {level_name} ({level:,.0f})",
                     "level": level, "level_name": level_name, "score": 7,
                 })
-
-        # BEAR BREAKDOWN
         if spot < level - follow and _bars_below(bars, level, confirm) and mom3 <= -min_mom:
             score = 7
             if below_vwap:                        score += 2
@@ -596,8 +531,6 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
                 "level": level, "level_name": level_name, "score": score,
             })
             print(f"  [BRK] BEAR {level_name} score={score}")
-
-        # BEAR RETEST
         elif level - BREAKOUT_RETEST_WINDOW <= spot < level:
             was_below = any(b["c"] < level - follow for b in bars[-RETEST_LOOKBACK:-3])
             if was_below and mom3 <= 0 and below_vwap:
@@ -606,8 +539,6 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
                     "trigger": f"Retest fail {level_name} ({level:,.0f})",
                     "level": level, "level_name": level_name, "score": 7,
                 })
-
-    # VWAP reclaim / rejection
     if vwap and len(bars) >= 2:
         prev = bars[-2]["c"]
         if prev < vwap <= spot and mom3 >= min_mom and _bars_above(bars, vwap, confirm):
@@ -624,17 +555,14 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
                 "trigger": f"VWAP Rejection ({vwap:,.2f})",
                 "level": vwap, "level_name": "VWAP", "score": score,
             })
-
     if not candidates:
         return None
-
     type_rank = {"BREAKOUT": 2, "BREAKDOWN": 2, "RETEST": 1}
     candidates.sort(key=lambda x: (x["score"], type_rank.get(x["signal_type"], 0)), reverse=True)
     best   = candidates[0]
     extras = [c["trigger"] for c in candidates[1:4]]
     quality = "STRONG" if best["score"] >= 11 else "HIGH" if best["score"] >= 9 else "MEDIUM"
     exits   = build_exit_params(session, regime, atr, best["bias"], spot, vwap)
-
     return {
         "signal_type":    best["signal_type"],
         "trigger":        best["trigger"],
@@ -655,6 +583,163 @@ def evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set):
     }
 
 # ─────────────────────────────────────────
+# ENGINE 3 — TRAP / FAILED BREAKOUT (TERTIARY)
+# ─────────────────────────────────────────
+def evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set):
+    """
+    Tertiary engine. Detects failed breakouts / trap reversals.
+
+    Conditions for a BEAR trap (failed bull breakout → PUT):
+      1. Within TRAP_MAX_BARS ago, price broke above a structural level
+         by at least TRAP_MIN_RECROSS = max(2.0, atr * 0.25)
+      2. Current bar has closed back below that level by at least TRAP_MIN_RECROSS
+      3. Current 3-bar momentum is negative (flipped)
+      4. Failure bar range >= atr * 0.20 (not a doji)
+
+    Symmetrical for BULL trap (failed bear breakdown → CALL).
+
+    VWAP is excluded as a trap level (handled by breakout engine).
+    OR levels excluded until or_set=True.
+
+    Scoring:
+      Base: TRAP_BASE_SCORE (10)
+      +2  VWAP now on correct side (confirms failure direction)
+      +2  OR level involved
+      +2  PDH/PDL involved
+      +1  momentum accelerating in failure direction
+      Soft penalty -2 if trap is against dominant structure
+        (bearish trap but price still well above VWAP: may be normal pullback)
+    """
+    if len(bars) < TRAP_MAX_BARS + 2 or not key_levels:
+        return None
+
+    spot     = bars[-1]["c"]
+    atr      = calc_atr(bars)
+    regime   = get_regime(vix)
+    mom3     = calc_momentum(bars, 3)
+    above_vwap = vwap and spot > vwap
+    below_vwap = vwap and spot < vwap
+
+    # ATR-scaled recross threshold
+    trap_min_recross = max(2.0, atr * 0.25)
+
+    # Failure bar range check
+    latest_range = bars[-1]["h"] - bars[-1]["l"]
+    if latest_range < atr * 0.20:
+        return None
+
+    # Session-aware momentum minimum
+    if session == "MORNING":
+        min_mom = BREAKOUT_MIN_MOMENTUM
+    elif session == "MIDDAY":
+        min_mom = 2.5
+    else:
+        min_mom = 2.0
+
+    candidates = []
+
+    for level_name, level in key_levels.items():
+        if level is None:
+            continue
+        if level_name == "VWAP":
+            continue  # VWAP traps handled by breakout engine
+        if "OR" in level_name and not or_set:
+            continue
+
+        # Only look at bars immediately before current — breakout must be recent
+        recent_break_window = bars[-3:-1]
+
+        # ── BEAR TRAP: broke above level, failed back below ──────────────────
+        was_above = any(b["c"] > level + trap_min_recross for b in recent_break_window)
+        # Current bar closed back below level - recross threshold
+        now_below = spot < level - trap_min_recross
+        # Momentum flipped bearish
+        if was_above and now_below and mom3 <= -min_mom:
+            score = TRAP_BASE_SCORE
+            # VWAP now below (confirms bears in control)
+            if below_vwap:
+                score += 2
+            if "OR" in level_name:
+                score += 2
+            if "Prev Day High" in level_name:
+                score += 2
+            if "PM" in level_name:
+                score += 1
+            # Acceleration in failure direction
+            if len(bars) >= 7:
+                prior_mom3 = bars[-4]["c"] - bars[-7]["c"]
+                if mom3 < prior_mom3 < 0:
+                    score += 1
+            # Soft penalty: still above VWAP by meaningful distance — may be normal pullback
+            if above_vwap and vwap and abs(spot - vwap) > atr * 0.5:
+                score -= 2
+                print(f"  [TRAP] Bear trap penalty: still {abs(spot - vwap):.1f}pts above VWAP")
+            if score >= 10:
+                candidates.append({
+                    "bias": "BEAR", "signal_type": "TRAP",
+                    "trigger": f"Failed breakout above {level_name} ({level:,.0f}) — trapped longs",
+                    "level": level, "level_name": level_name, "score": score,
+                })
+                print(f"  [TRAP] BEAR trap {level_name} score={score} mom={mom3:+.1f}")
+
+        # ── BULL TRAP: broke below level, failed back above ──────────────────
+        was_below = any(b["c"] < level - trap_min_recross for b in recent_break_window)
+        now_above = spot > level + trap_min_recross
+        if was_below and now_above and mom3 >= min_mom:
+            score = TRAP_BASE_SCORE
+            if above_vwap:
+                score += 2
+            if "OR" in level_name:
+                score += 2
+            if "Prev Day Low" in level_name:
+                score += 2
+            if "PM" in level_name:
+                score += 1
+            if len(bars) >= 7:
+                prior_mom3 = bars[-4]["c"] - bars[-7]["c"]
+                if mom3 > prior_mom3 > 0:
+                    score += 1
+            # Soft penalty: still below VWAP — may be normal bounce
+            if below_vwap and vwap and abs(spot - vwap) > atr * 0.5:
+                score -= 2
+                print(f"  [TRAP] Bull trap penalty: still {abs(spot - vwap):.1f}pts below VWAP")
+            if score >= 10:
+                candidates.append({
+                    "bias": "BULL", "signal_type": "TRAP",
+                    "trigger": f"Failed breakdown below {level_name} ({level:,.0f}) — trapped shorts",
+                    "level": level, "level_name": level_name, "score": score,
+                })
+                print(f"  [TRAP] BULL trap {level_name} score={score} mom={mom3:+.1f}")
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best    = candidates[0]
+    quality = "STRONG" if best["score"] >= 12 else "HIGH" if best["score"] >= 10 else "MEDIUM"
+    exits   = build_exit_params(session, regime, atr, best["bias"], spot, vwap)
+
+    return {
+        "signal_type":    best["signal_type"],
+        "trigger":        best["trigger"],
+        "bias":           best["bias"],
+        "score":          best["score"],
+        "quality":        quality,
+        "regime":         regime,
+        "session":        session,
+        "spot":           round(spot, 2),
+        "vwap":           vwap,
+        "momentum":       mom3,
+        "atr":            atr,
+        "vix":            vix,
+        "level":          best.get("level"),
+        "level_name":     best.get("level_name", ""),
+        "time_stop":      "3:45 PM ET",
+        "all_candidates": [c["trigger"] for c in candidates[1:4]],
+        **exits,
+    }
+
+# ─────────────────────────────────────────
 # COMBINED EVALUATOR
 # ─────────────────────────────────────────
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
@@ -664,20 +749,32 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
         if (now_et - last_signal_time).total_seconds() / 60 < COOLDOWN_MINUTES:
             return None
 
-    mom_sig = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
+    mom_sig  = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
                                         key_levels=key_levels, now_et=now_et)
-    brk_sig = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
+    brk_sig  = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
+    trap_sig = evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set)
 
-    if mom_sig and brk_sig:
-        best = mom_sig if mom_sig["score"] >= brk_sig["score"] - 1 else brk_sig
-        winner = "momentum" if best is mom_sig else "breakout"
-        print(f"  -> {winner} wins (mom={mom_sig['score']} brk={brk_sig['score']})")
-    elif mom_sig:
-        best = mom_sig
-    elif brk_sig:
-        best = brk_sig
-    else:
+    # Rank all three — pick highest score
+    # Momentum wins ties with breakout (score >= brk - 1)
+    # Trap wins outright if highest score (traps are high conviction)
+    candidates = [s for s in [mom_sig, brk_sig, trap_sig] if s is not None]
+    if not candidates:
         return None
+
+    # Sort by score descending; momentum beats breakout on ties
+    def rank_key(s):
+        base = s["score"]
+        # Tiebreak: momentum > trap > breakout
+        type_bonus = {"MOMENTUM": 0.5, "TRAP": 0.3}.get(s["signal_type"], 0)
+        return base + type_bonus
+
+    candidates.sort(key=rank_key, reverse=True)
+    best = candidates[0]
+
+    # Log winner
+    if len(candidates) > 1:
+        others = ", ".join(f"{s['signal_type']}={s['score']}" for s in candidates[1:])
+        print(f"  -> {best['signal_type']} wins score={best['score']} (vs {others})")
 
     if last_signal_price and last_signal_bias == best["bias"]:
         if abs(best["spot"] - last_signal_price) < MIN_SIGNAL_DISTANCE:
@@ -760,7 +857,7 @@ def send_telegram(message):
     except queue.Full:
         print(f"[TELEGRAM] Queue full - dropped")
 
-def format_signal_message(sig, alert_count, max_alerts):
+def format_signal_message(sig, alert_count):
     t     = datetime.datetime.now(ET).strftime("%I:%M %p ET")
     emoji = "\U0001f7e2" if sig["bias"] == "BULL" else "\U0001f534"
     type_label = sig.get("signal_type", "SIGNAL")
@@ -770,7 +867,6 @@ def format_signal_message(sig, alert_count, max_alerts):
     regime_str = regime_labels.get(sig["regime"], sig["regime"])
     vix_str  = f"{sig['vix']:.1f}" if sig.get("vix") else "N/A"
     vwap_str = f"{sig['vwap']:,.2f}" if sig.get("vwap") else "N/A"
-
     msg = (
         f"*SPX 0DTE {type_label} {emoji} {sig['option_type']}*\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -790,7 +886,7 @@ def format_signal_message(sig, alert_count, max_alerts):
         f"*No chase:* past {sig['no_chase']:,.2f}\n"
         f"*Exit by:* {sig['time_stop']}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"Alert {alert_count}/{max_alerts}"
+        f"Alert #{alert_count}"
     )
     extras = sig.get("all_candidates", [])
     if extras:
@@ -812,7 +908,7 @@ def format_premarket_message(vix, key_levels, events):
         f"*High-Impact Events:*\n{events_str}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"Scanning 9:30 AM - 3:30 PM ET\n"
-        f"Signals: Momentum impulse (primary) + Key level breakouts (secondary)\n"
+        f"Signals: Momentum (primary) + Breakout (secondary) + Trap reversals\n"
         f"Blackout: 30min before / 1min after events"
     )
 
@@ -874,7 +970,7 @@ def main():
     or_set            = False
     vwap_history      = []
     last_bar_time     = None
-    levels_loaded     = False  # gate: signals disabled until levels.py loads successfully
+    levels_loaded     = False
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -913,8 +1009,6 @@ def main():
                     "Prev Day Low":   prev["pdl"],
                     "Prev Day Close": prev["pdc"],
                 }
-
-            # ── Manual key levels — loaded from levels.py ─────────────────────
             try:
                 import importlib, levels as lvl_mod
                 importlib.reload(lvl_mod)
@@ -931,7 +1025,6 @@ def main():
                     f"Signal generation is DISABLED for this session.\n"
                     f"Upload a valid levels.py and redeploy to re-enable."
                 )
-            # ─────────────────────────────────────────────────────────────────
             bars_pm = get_spx_bars(limit=30)
             if bars_pm:
                 spot_pm     = bars_pm[-1]["c"]
@@ -960,11 +1053,6 @@ def main():
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            if alert_count >= MAX_ALERTS_PER_DAY:
-                print(f"[{now_et.strftime('%H:%M ET')}] Max alerts reached.")
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
             bars = get_spx_bars(limit=80)
             if not bars or len(bars) < 2:
                 print(f"[{now_et.strftime('%H:%M ET')}] Insufficient bars ({len(bars) if bars else 0}) — skipping.")
@@ -978,25 +1066,19 @@ def main():
             spot    = bars[-1]["c"]
             vix     = get_vix()
             session = get_session(now_et)
-            vix_str = f"{vix:.1f}" if vix else "N/A"  # temporary; overwritten below
 
-            # Once-per-completed-bar gate
-            # bars[-1] is the live unfinished bar; bars[-2] is the last completed bar
             completed_bar_t = bars[-2]["t"] if len(bars) >= 2 else None
             new_bar = completed_bar_t != last_bar_time
 
-            # All signal logic uses completed bars only
             closed_bars = bars[:-1]
             closed_vwap = calc_vwap(closed_bars)
 
-            # Debug: confirm last completed bar is current, not stale
             if closed_bars:
                 last_bar_dt = datetime.datetime.fromtimestamp(
                     closed_bars[-1]["t"] / 1000, ET
                 ).strftime("%H:%M ET") if closed_bars[-1].get("t") else "no-ts"
                 print(f"  [BAR] last completed bar: {last_bar_dt} close={closed_bars[-1]['c']:,.2f}")
 
-            # Stale data guard — skip signal eval if last completed bar is too old
             if closed_bars and closed_bars[-1].get("t"):
                 last_bar_ts = datetime.datetime.fromtimestamp(closed_bars[-1]["t"] / 1000, ET)
                 bar_age     = (now_et - last_bar_ts).total_seconds()
@@ -1007,7 +1089,6 @@ def main():
 
             if new_bar:
                 last_bar_time = completed_bar_t
-
                 if closed_vwap is not None:
                     vwap_history.append(closed_vwap)
                     if len(vwap_history) > 60:
@@ -1020,7 +1101,6 @@ def main():
             vix_str = f"{vix:.1f}" if vix else "N/A"
             print(f"[{now_et.strftime('%H:%M ET')}] SPX={spot:,.2f} VWAP={closed_vwap} VIX={vix_str} session={session} new_bar={new_bar}")
 
-            # Opening range (9:30-9:45) — build in background, do NOT skip signal eval
             or_start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
             or_end   = now_et.replace(hour=9, minute=45, second=0, microsecond=0)
             if now_et < or_end:
@@ -1037,7 +1117,7 @@ def main():
                 print(f"  -> OR locked: {or_low:.2f} - {or_high:.2f}")
                 send_telegram(
                     f"\U0001f4ca *Opening Range Set*\nHigh: {or_high:,.2f}\nLow: {or_low:,.2f}\n"
-                    f"Scanning for momentum + breakouts..."
+                    f"Scanning for momentum + breakouts + traps..."
                 )
 
             if vix and last_vix:
@@ -1056,7 +1136,7 @@ def main():
                 send_telegram(
                     f"\U0001f499 *Bot Heartbeat* - {now_et.strftime('%I:%M %p ET')}\n"
                     f"SPX={spot:,.2f} | VWAP={closed_vwap} | VIX={vix_str}\n"
-                    f"Alerts today: {alert_count}/{MAX_ALERTS_PER_DAY}"
+                    f"Alerts today: {alert_count}"
                 )
 
             global _telegram_thread
@@ -1065,7 +1145,6 @@ def main():
                 _telegram_thread = threading.Thread(target=_telegram_worker, daemon=True)
                 _telegram_thread.start()
 
-            # Signal eval: only on new completed bar, within entry window, with levels loaded
             if new_bar and now_et.time() <= datetime.time(15, 30):
                 if not levels_loaded:
                     print(f"  -> Signal generation DISABLED — levels.py failed to load")
@@ -1081,7 +1160,7 @@ def main():
                         last_signal_time  = now_et
                         last_signal_price = sig["spot"]
                         last_signal_bias  = sig["bias"]
-                        msg = format_signal_message(sig, alert_count, MAX_ALERTS_PER_DAY)
+                        msg = format_signal_message(sig, alert_count)
                         send_telegram(msg)
                         log_signal(sig)
                         print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
