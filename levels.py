@@ -4,31 +4,32 @@
 # bot.py imports MANUAL_LEVELS automatically
 # ─────────────────────────────────────────
 
-# Date: April 30, 2026
+# Date: May 1, 2026
 # Source: Godzilla Trader / GT level map
 
 MANUAL_LEVELS = {
-    # Expected moves — SPX at ~7,136
-    "Daily 1SD Upper 7200":    7200.0,   # Bull target
-    "Daily 1SD Lower 7072":    7072.0,   # Bear line
+    # Expected moves — SPX at ~7,222
+    "Daily 1SD Upper 7250":    7250.0,   # Bull target — right above price
+    "Daily 1SD Lower 7168":    7168.0,   # Bear line / key support
     "Weekly 1SD Upper 7295":   7295.0,   # Weekly upper
     "Weekly 1SD Lower 7035":   7035.0,   # Weekly lower
-    "5 DMA 7144":              7144.0,   # 5-day MA — resistance above
+    "5 DMA 7164":              7164.0,   # 5-day MA — support below
 
     # VWAP cluster — top 2 only
-    "WTD VWAP 7142":           7142.70,  # WTD VWAP — right at price
-    "ATH VWAP 7135":           7135.96,  # ATH VWAP — key support
+    "ATH VWAP 7212":           7212.60,  # ATH VWAP — just below price
+    "WTD VWAP 7209":           7209.02,  # WTD VWAP
 
-    # Prior session VWAPs
-    "VWAP 7131":               7131.29,  # Prior session
-    "VWAP 7129":               7129.77,  # Prior session support
+    # Prior session VWAPs — 2 most relevant
+    "VWAP 7186":               7186.94,  # Prior session
+    "VWAP 7155":               7155.71,  # Prior session support
 
     # Gamma flip
     "Gamma Flip 7017":         7017.0,   # Major structural level
 
     # Round numbers
-    "Round 7100":              7100.0,
     "Round 7200":              7200.0,
+    "Round 7300":              7300.0,
 }
+
 
 
