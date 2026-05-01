@@ -893,33 +893,255 @@ def evaluate_trend_grind_signal(bars, vwap, vwap_history, vix, session, now_et):
     }
 
 # ─────────────────────────────────────────
+# ENGINE 5 — VWAP ACCEPTANCE (TWO-TIER)
+# ─────────────────────────────────────────
+def evaluate_vwap_acceptance_signal(bars, vwap, vwap_history, vix, session, now_et, or_high=None, or_low=None):
+    """
+    Two-tier early regime shift detector.
+
+    EARLY tier (VWAP_ACCEPTANCE_EARLY):
+      - 4 of last 6 bars above/below VWAP
+      - 6-bar net move >= 3pts in direction
+      - VWAP slope not strongly opposing (>= -0.05 BULL / <= +0.05 BEAR)
+      - Spot within 1.2 ATR of VWAP
+      - No rejection wick > 40%
+      - Base score: 4 (+1 slope aligned, +1 mom3 aligned, +1 OR midpoint)
+
+    CONFIRMED tier (VWAP_ACCEPTANCE):
+      - 5 of last 7 bars above/below VWAP
+      - 7-bar net move >= 5pts in direction
+      - Same slope/extension/wick filters
+      - Base score: 5 (+1 slope aligned, +1 OR midpoint)
+
+    Early tier fires first if it qualifies. Confirmed tier only fires if early
+    conditions are NOT met (avoids double-firing on same setup).
+    Both respect cooldown and distance filters in evaluate_signal.
+    """
+    if not vwap:
+        return None
+    if now_et.time() < datetime.time(9, 45):
+        return None
+
+    rth_bars = [b for b in bars if b.get("t") and
+                datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+
+    spot   = bars[-1]["c"]
+    atr    = calc_atr(bars)
+    regime = get_regime(vix)
+    latest = bars[-1]
+    mom3   = calc_momentum(bars, 3)
+
+    vwap_slope = calc_vwap_slope(vwap_history, n=5)
+    vwap_dist  = abs(spot - vwap)
+    bar_range  = latest["h"] - latest["l"]
+
+    or_mid = (or_high + or_low) / 2 if (or_high is not None and or_low is not None) else None
+
+    def wick_rejected(direction):
+        if bar_range < 0.5:
+            return False
+        if direction == "BULL":
+            return (latest["h"] - latest["c"]) / bar_range > 0.40
+        else:
+            return (latest["c"] - latest["l"]) / bar_range > 0.40
+
+    # ── EARLY TIER ───────────────────────────────────────────────────────────
+    if len(rth_bars) >= 6:
+        last6 = rth_bars[-6:]
+        if len(vwap_history) >= 6:
+            hist6 = vwap_history[-6:]
+            early_above = sum(1 for i, b in enumerate(last6) if b["c"] > hist6[i])
+            early_below = sum(1 for i, b in enumerate(last6) if b["c"] < hist6[i])
+        else:
+            early_above = sum(1 for b in last6 if b["c"] > vwap)
+            early_below = sum(1 for b in last6 if b["c"] < vwap)
+
+        net6 = last6[-1]["c"] - last6[0]["c"]
+
+        if early_above >= 4:
+            early_dir = "BULL"
+        elif early_below >= 4:
+            early_dir = "BEAR"
+        else:
+            early_dir = None
+
+        if early_dir:
+            slope_ok  = (early_dir == "BULL" and vwap_slope >= -0.05) or (early_dir == "BEAR" and vwap_slope <= 0.05)
+            net_ok    = (early_dir == "BULL" and net6 >= 3.0) or (early_dir == "BEAR" and net6 <= -3.0)
+            ext_ok    = vwap_dist <= atr * 1.2
+            wick_ok   = not wick_rejected(early_dir)
+
+            if slope_ok and net_ok and ext_ok and wick_ok:
+                score = 4
+                if (early_dir == "BULL" and vwap_slope > 0.20) or (early_dir == "BEAR" and vwap_slope < -0.20):
+                    score += 1
+                if (early_dir == "BULL" and mom3 > 0) or (early_dir == "BEAR" and mom3 < 0):
+                    score += 1
+                if or_mid is not None:
+                    if (early_dir == "BULL" and spot > or_mid) or (early_dir == "BEAR" and spot < or_mid):
+                        score += 1
+
+                aligned = early_above if early_dir == "BULL" else early_below
+                print(f"  [EARLY] dir={early_dir} score={score} net6={net6:+.1f}pts slope={vwap_slope:+.3f} mom3={mom3:+.1f} aligned={aligned}/6")
+
+                exits = build_exit_params(session, regime, atr, early_dir, spot, vwap)
+                return {
+                    "signal_type": "VWAP_ACCEPTANCE_EARLY",
+                    "trigger":     f"VWAP early acceptance {early_dir} | {aligned}/6 bars aligned | net {net6:+.1f}pts",
+                    "bias":        early_dir,
+                    "score":       score,
+                    "quality":     "MEDIUM",
+                    "regime":      regime,
+                    "session":     session,
+                    "spot":        round(spot, 2),
+                    "vwap":        vwap,
+                    "momentum":    mom3,
+                    "atr":         atr,
+                    "vix":         vix,
+                    "level":       None,
+                    "level_name":  "",
+                    "time_stop":   "3:45 PM ET",
+                    "all_candidates": [],
+                    **exits,
+                }
+
+    # ── CONFIRMED TIER ───────────────────────────────────────────────────────
+    if len(rth_bars) < 7:
+        return None
+
+    last7 = rth_bars[-7:]
+    if len(vwap_history) >= 7:
+        hist7 = vwap_history[-7:]
+        bars_above = sum(1 for i, b in enumerate(last7) if b["c"] > hist7[i])
+        bars_below = sum(1 for i, b in enumerate(last7) if b["c"] < hist7[i])
+    else:
+        bars_above = sum(1 for b in last7 if b["c"] > vwap)
+        bars_below = sum(1 for b in last7 if b["c"] < vwap)
+
+    if bars_above >= 5:
+        direction = "BULL"
+    elif bars_below >= 5:
+        direction = "BEAR"
+    else:
+        return None
+
+    slope_ok = (direction == "BULL" and vwap_slope >= -0.05) or (direction == "BEAR" and vwap_slope <= 0.05)
+    if not slope_ok:
+        print(f"  [ACCEPT] {direction} blocked: slope {vwap_slope:+.3f} opposing")
+        return None
+
+    net7 = last7[-1]["c"] - last7[0]["c"]
+    if (direction == "BULL" and net7 < 5.0) or (direction == "BEAR" and net7 > -5.0):
+        print(f"  [ACCEPT] {direction} blocked: 7-bar net {net7:+.1f}")
+        return None
+
+    if vwap_dist > atr * 1.5:
+        print(f"  [ACCEPT] Blocked: too extended {vwap_dist:.1f}pts from VWAP")
+        return None
+
+    if wick_rejected(direction):
+        print(f"  [ACCEPT] {direction} blocked: rejection wick")
+        return None
+
+    score = 5
+    if (direction == "BULL" and vwap_slope > 0.3) or (direction == "BEAR" and vwap_slope < -0.3):
+        score += 1
+    if or_mid is not None:
+        if (direction == "BULL" and spot > or_mid) or (direction == "BEAR" and spot < or_mid):
+            score += 1
+
+    aligned = bars_above if direction == "BULL" else bars_below
+    print(f"  [ACCEPT] dir={direction} score={score} net7={net7:+.1f}pts slope={vwap_slope:+.3f} mom3={mom3:+.1f} aligned={aligned}/7")
+
+    exits = build_exit_params(session, regime, atr, direction, spot, vwap)
+    return {
+        "signal_type": "VWAP_ACCEPTANCE",
+        "trigger":     f"VWAP acceptance {direction} | {aligned}/7 bars aligned | net {net7:+.1f}pts",
+        "bias":        direction,
+        "score":       score,
+        "quality":     "MEDIUM",
+        "regime":      regime,
+        "session":     session,
+        "spot":        round(spot, 2),
+        "vwap":        vwap,
+        "momentum":    mom3,
+        "atr":         atr,
+        "vix":         vix,
+        "level":       None,
+        "level_name":  "",
+        "time_stop":   "3:45 PM ET",
+        "all_candidates": [],
+        **exits,
+    }
+
+# ─────────────────────────────────────────
 # COMBINED EVALUATOR
 # ─────────────────────────────────────────
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
-                    last_signal_time, last_signal_price, last_signal_bias, or_set):
+                    last_signal_time, last_signal_price, last_signal_bias, or_set,
+                    or_high=None, or_low=None):
     now_et = datetime.datetime.now(ET)
     if last_signal_time:
         if (now_et - last_signal_time).total_seconds() / 60 < COOLDOWN_MINUTES:
             return None
 
-    mom_sig   = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
-                                         key_levels=key_levels, now_et=now_et)
-    brk_sig   = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
-    trap_sig  = evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set)
-    grind_sig = evaluate_trend_grind_signal(bars, vwap, vwap_history, vix, session, now_et)
+    mom_sig    = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
+                                          key_levels=key_levels, now_et=now_et)
+    brk_sig    = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
+    trap_sig   = evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set)
+    grind_sig  = evaluate_trend_grind_signal(bars, vwap, vwap_history, vix, session, now_et)
+    accept_sig = evaluate_vwap_acceptance_signal(bars, vwap, vwap_history, vix, session, now_et,
+                                                  or_high=or_high, or_low=or_low)
 
-    # Rank all four — pick highest score
-    candidates = [s for s in [mom_sig, brk_sig, trap_sig, grind_sig] if s is not None]
+    # Rank all five — pick highest score
+    candidates = [s for s in [mom_sig, brk_sig, trap_sig, grind_sig, accept_sig] if s is not None]
     if not candidates:
         return None
 
     def rank_key(s):
         base = s["score"]
-        # Tiebreak: momentum > trap > grind > breakout
-        type_bonus = {"MOMENTUM": 0.5, "TRAP": 0.3, "TREND_GRIND": 0.2}.get(s["signal_type"], 0)
+        # Tiebreak: momentum > trap > grind > acceptance > breakout
+        type_bonus = {"MOMENTUM": 0.5, "TRAP": 0.3, "TREND_GRIND": 0.2, "VWAP_ACCEPTANCE": 0.1, "VWAP_ACCEPTANCE_EARLY": 0.05}.get(s["signal_type"], 0)
         return base + type_bonus
 
     candidates.sort(key=rank_key, reverse=True)
+
+    # Early regime shift priority — only override when no truly strong non-early signal exists
+    early_sig = next((s for s in candidates if s["signal_type"] == "VWAP_ACCEPTANCE_EARLY"), None)
+    non_early = [s for s in candidates if s["signal_type"] != "VWAP_ACCEPTANCE_EARLY"]
+    top_non_early = non_early[0] if non_early else None
+    if early_sig:
+        if top_non_early:
+            stronger_signal_exists = (
+                top_non_early["score"] >= early_sig["score"] + 3
+                and top_non_early["score"] > 8
+            )
+        else:
+            stronger_signal_exists = False
+        if not stronger_signal_exists:
+            if last_signal_price and last_signal_bias == early_sig["bias"]:
+                if abs(early_sig["spot"] - last_signal_price) < MIN_SIGNAL_DISTANCE:
+                    print("  -> EARLY distance filter blocked")
+                else:
+                    print(
+                        f"  -> EARLY signal prioritized over "
+                        f"{top_non_early['signal_type'] if top_non_early else 'none'}="
+                        f"{top_non_early['score'] if top_non_early else 'N/A'}"
+                    )
+                    return early_sig
+            else:
+                print(
+                    f"  -> EARLY signal prioritized over "
+                    f"{top_non_early['signal_type'] if top_non_early else 'none'}="
+                    f"{top_non_early['score'] if top_non_early else 'N/A'}"
+                )
+                return early_sig
+        else:
+            print(
+                f"  -> EARLY not prioritized: stronger "
+                f"{top_non_early['signal_type']} score={top_non_early['score']} "
+                f"vs early={early_sig['score']}"
+            )
     best = candidates[0]
 
     if len(candidates) > 1:
@@ -1303,7 +1525,8 @@ def main():
                 else:
                     sig = evaluate_signal(
                         closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
-                        last_signal_time, last_signal_price, last_signal_bias, or_set
+                        last_signal_time, last_signal_price, last_signal_bias, or_set,
+                        or_high=or_high, or_low=or_low
                     )
                     if sig:
                         alert_count      += 1
