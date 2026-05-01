@@ -740,6 +740,159 @@ def evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set):
     }
 
 # ─────────────────────────────────────────
+# ENGINE 4 — TREND GRIND / VWAP WALK (QUATERNARY)
+# ─────────────────────────────────────────
+def evaluate_trend_grind_signal(bars, vwap, vwap_history, vix, session, now_et):
+    """
+    Detects slow VWAP-walk trend days missed by the momentum engine.
+    Fires when price is steadily grinding above (BULL) or below (BEAR) VWAP
+    with consistent structure — not a sharp impulse, but a persistent directional walk.
+
+    Conditions (BULL):
+      - >= 20 completed RTH bars
+      - Time >= 9:45 ET (stable bar history)
+      - Price above VWAP for >= 15 of last 20 bars
+      - VWAP slope positive over last 5 readings
+      - 20-bar net move >= 15pts upward
+      - Higher highs AND higher lows over last 10 bars
+      - Spot not extended > 2 ATR from VWAP (not chasing)
+      - No large rejection wick on latest bar (wick < 40% of range)
+      - NOT in first 15 minutes (9:30–9:45)
+
+    Scoring (max ~9):
+      Base: 6
+      +1  VWAP slope > 0.5 (strong slope)
+      +1  20-bar net move >= 25pts (strong grind)
+      +1  spot within 0.5 ATR of VWAP (tight walk, not extended)
+
+    Respects existing cooldown and distance filters (applied in evaluate_signal).
+    Signal label: TREND_GRIND
+    """
+    if not vwap or not vwap_history:
+        return None
+
+    # Time guard — no early session
+    if now_et.time() < datetime.time(9, 45):
+        return None
+
+    # Need enough RTH bars
+    rth_bars = [b for b in bars if b.get("t") and
+                datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+    if len(rth_bars) < 20:
+        return None
+
+    spot    = bars[-1]["c"]
+    atr     = calc_atr(bars)
+    regime  = get_regime(vix)
+    latest  = bars[-1]
+
+    recent20 = rth_bars[-20:]
+
+    # VWAP alignment count over last 20 bars
+    # Use vwap_history if long enough, else use current vwap as proxy
+    if len(vwap_history) >= 20:
+        hist20 = vwap_history[-20:]
+        bars_above_vwap = sum(1 for i, b in enumerate(recent20) if b["c"] > hist20[i])
+        bars_below_vwap = sum(1 for i, b in enumerate(recent20) if b["c"] < hist20[i])
+    else:
+        bars_above_vwap = sum(1 for b in recent20 if b["c"] > vwap)
+        bars_below_vwap = sum(1 for b in recent20 if b["c"] < vwap)
+
+    # Determine candidate direction
+    if bars_above_vwap >= 12:
+        direction = "BULL"
+    elif bars_below_vwap >= 12:
+        direction = "BEAR"
+    else:
+        return None
+
+    # VWAP slope
+    vwap_slope = calc_vwap_slope(vwap_history, n=5)
+    if direction == "BULL" and vwap_slope < -0.05:
+        print(f"  [GRIND] BULL blocked: VWAP slope {vwap_slope:+.3f} too negative")
+        return None
+    if direction == "BEAR" and vwap_slope > 0.05:
+        print(f"  [GRIND] BEAR blocked: VWAP slope {vwap_slope:+.3f} too positive")
+        return None
+
+    # 20-bar net move threshold
+    net_move = recent20[-1]["c"] - recent20[0]["c"]
+    if direction == "BULL" and net_move < 15.0:
+        print(f"  [GRIND] BULL blocked: 20-bar net move {net_move:+.1f} < 15pts")
+        return None
+    if direction == "BEAR" and net_move > -15.0:
+        print(f"  [GRIND] BEAR blocked: 20-bar net move {net_move:+.1f} > -15pts")
+        return None
+
+    # Directional bias over last 10 bars — simpler and more reliable than HH/HL intraday
+    last10 = rth_bars[-10:]
+    net10  = last10[-1]["c"] - last10[0]["c"]
+    if direction == "BULL" and net10 <= 0:
+        print(f"  [GRIND] BULL blocked: 10-bar net {net10:+.1f} not positive")
+        return None
+    if direction == "BEAR" and net10 >= 0:
+        print(f"  [GRIND] BEAR blocked: 10-bar net {net10:+.1f} not negative")
+        return None
+
+    # Extension check — not chasing
+    vwap_dist = abs(spot - vwap)
+    if vwap_dist > atr * 2.0:
+        print(f"  [GRIND] Blocked: too extended {vwap_dist:.1f}pts from VWAP (>{atr * 2.0:.1f})")
+        return None
+
+    # Wick filter on latest bar
+    bar_range = latest["h"] - latest["l"]
+    if bar_range > 0.5:
+        if direction == "BULL":
+            upper_wick = latest["h"] - latest["c"]
+            if upper_wick / bar_range > 0.40:
+                print(f"  [GRIND] BULL blocked: rejection wick {upper_wick/bar_range:.0%}")
+                return None
+        else:
+            lower_wick = latest["c"] - latest["l"]
+            if lower_wick / bar_range > 0.40:
+                print(f"  [GRIND] BEAR blocked: rejection wick {lower_wick/bar_range:.0%}")
+                return None
+
+    # Scoring
+    mom3  = calc_momentum(bars, 3)
+    score = 6  # base
+    if (direction == "BULL" and vwap_slope > 0.5) or (direction == "BEAR" and vwap_slope < -0.5):
+        score += 1
+    if abs(net_move) >= 25.0:
+        score += 1
+    if vwap_dist <= atr * 0.5:
+        score += 1  # tight walk — high quality grind
+    # Short-term momentum alignment bonus — avoid entering stalling grinds
+    if (direction == "BULL" and mom3 > 0) or (direction == "BEAR" and mom3 < 0):
+        score += 1
+
+    print(f"  [GRIND] dir={direction} score={score} net={net_move:+.1f}pts slope={vwap_slope:+.3f} mom3={mom3:+.1f} aligned={bars_above_vwap if direction == 'BULL' else bars_below_vwap}/20")
+
+    quality = "HIGH" if score >= 8 else "MEDIUM"
+    exits   = build_exit_params(session, regime, atr, direction, spot, vwap)
+
+    return {
+        "signal_type": "TREND_GRIND",
+        "trigger":     f"VWAP walk {direction} | {bars_above_vwap if direction == 'BULL' else bars_below_vwap}/20 bars aligned | net {net_move:+.1f}pts",
+        "bias":        direction,
+        "score":       score,
+        "quality":     quality,
+        "regime":      regime,
+        "session":     session,
+        "spot":        round(spot, 2),
+        "vwap":        vwap,
+        "momentum":    mom3,
+        "atr":         atr,
+        "vix":         vix,
+        "level":       None,
+        "level_name":  "",
+        "time_stop":   "3:45 PM ET",
+        "all_candidates": [],
+        **exits,
+    }
+
+# ─────────────────────────────────────────
 # COMBINED EVALUATOR
 # ─────────────────────────────────────────
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
@@ -749,29 +902,26 @@ def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
         if (now_et - last_signal_time).total_seconds() / 60 < COOLDOWN_MINUTES:
             return None
 
-    mom_sig  = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
-                                        key_levels=key_levels, now_et=now_et)
-    brk_sig  = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
-    trap_sig = evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set)
+    mom_sig   = evaluate_momentum_signal(bars, vwap, vwap_history, vix, session,
+                                         key_levels=key_levels, now_et=now_et)
+    brk_sig   = evaluate_breakout_signal(bars, key_levels, vwap, vix, session, or_set)
+    trap_sig  = evaluate_trap_signal(bars, key_levels, vwap, vix, session, or_set)
+    grind_sig = evaluate_trend_grind_signal(bars, vwap, vwap_history, vix, session, now_et)
 
-    # Rank all three — pick highest score
-    # Momentum wins ties with breakout (score >= brk - 1)
-    # Trap wins outright if highest score (traps are high conviction)
-    candidates = [s for s in [mom_sig, brk_sig, trap_sig] if s is not None]
+    # Rank all four — pick highest score
+    candidates = [s for s in [mom_sig, brk_sig, trap_sig, grind_sig] if s is not None]
     if not candidates:
         return None
 
-    # Sort by score descending; momentum beats breakout on ties
     def rank_key(s):
         base = s["score"]
-        # Tiebreak: momentum > trap > breakout
-        type_bonus = {"MOMENTUM": 0.5, "TRAP": 0.3}.get(s["signal_type"], 0)
+        # Tiebreak: momentum > trap > grind > breakout
+        type_bonus = {"MOMENTUM": 0.5, "TRAP": 0.3, "TREND_GRIND": 0.2}.get(s["signal_type"], 0)
         return base + type_bonus
 
     candidates.sort(key=rank_key, reverse=True)
     best = candidates[0]
 
-    # Log winner
     if len(candidates) > 1:
         others = ", ".join(f"{s['signal_type']}={s['score']}" for s in candidates[1:])
         print(f"  -> {best['signal_type']} wins score={best['score']} (vs {others})")
