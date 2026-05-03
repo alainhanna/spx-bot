@@ -1287,52 +1287,117 @@ def detect_context(bars, vwap, vwap_history, key_levels):
     return {"bias": bias, "regime": regime, "location": location, "near_level": near_level}
 
 
+def cluster_levels(key_levels, proximity=5.0):
+    """
+    Group key levels within proximity pts of each other into zones.
+    Returns list of zone dicts: {name, low, high, mid, members}
+    Used by detect_setup to avoid firing separate alerts per level in the same cluster.
+    """
+    if not key_levels:
+        return []
+
+    # Sort non-None levels by price
+    sorted_levels = sorted(
+        [(name, price) for name, price in key_levels.items()
+         if price is not None and name != "VWAP"],
+        key=lambda x: x[1]
+    )
+
+    zones = []
+    i = 0
+    while i < len(sorted_levels):
+        name, price = sorted_levels[i]
+        cluster_names  = [name]
+        cluster_prices = [price]
+        j = i + 1
+        while j < len(sorted_levels) and sorted_levels[j][1] - cluster_prices[0] <= proximity:
+            cluster_names.append(sorted_levels[j][0])
+            cluster_prices.append(sorted_levels[j][1])
+            j += 1
+        low  = min(cluster_prices)
+        high = max(cluster_prices)
+        mid  = round((low + high) / 2, 2)
+        if len(cluster_names) > 1:
+            label = f"Zone {low:.0f}–{high:.0f}"
+        else:
+            label = cluster_names[0]
+        zones.append({
+            "name":    label,
+            "low":     low,
+            "high":    high,
+            "mid":     mid,
+            "members": cluster_names,
+        })
+        i = j
+    return zones
+
+
+def find_nearest_zone(spot, zones, proximity=8.0):
+    """Return the nearest zone within proximity pts of spot, or None."""
+    nearest = None
+    nearest_dist = float("inf")
+    for zone in zones:
+        dist = min(abs(spot - zone["low"]), abs(spot - zone["high"]), abs(spot - zone["mid"]))
+        if dist <= proximity and dist < nearest_dist:
+            nearest_dist = dist
+            nearest = zone
+    return nearest
+
+
 def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or_low=None):
     """
     Detects early structural setups and returns a setup object.
     Does NOT trigger trades — sends awareness alert only.
 
     Types:
-      COMPRESSION_SETUP     — range contracting near key level
-      VWAP_RECLAIM_SETUP    — price crossing and holding above/below VWAP
+      COMPRESSION_SETUP        — range contracting near key level/zone
+      VWAP_RECLAIM_SETUP       — price crossing and holding above/below VWAP
       TREND_CONTINUATION_SETUP — trend walking above VWAP with shallow pullbacks
+
+    Level clustering: levels within 5pts are treated as a single zone.
+    Only one setup alert fires per zone (dedup by zone name in evaluate_signal).
 
     Returns dict with type/bias/level/message/direction or None.
     """
     if not bars or not vwap:
         return None
 
-    spot  = bars[-1]["c"]
-    atr   = calc_atr(bars)
-    bias  = context["bias"]
+    spot   = bars[-1]["c"]
+    atr    = calc_atr(bars)
+    bias   = context["bias"]
     regime = context["regime"]
 
-    # ── COMPRESSION_SETUP — requires real structural level + confirmed range contraction ──
+    # Build clustered zones from key_levels
+    zones = cluster_levels(key_levels, proximity=5.0)
+
+    # ── COMPRESSION_SETUP — requires real structural zone + confirmed range contraction ──
     if regime == "COMPRESSION":
-        near = context["near_level"]
-        # Must be near a real level — not just VWAP alone
-        structural_levels = {"OR High", "OR Low", "Prev Day High", "Prev Day Low", "PM High", "PM Low"}
-        is_structural = near and near != "VWAP" and (
-            any(s in near for s in ["OR", "Prev Day", "PM", "Round", "Daily", "Weekly", "Gamma"]) or
-            near.startswith("R")
+        # Find nearest zone to spot
+        near_zone = find_nearest_zone(spot, zones, proximity=8.0)
+        is_structural = near_zone and any(
+            any(s in m for s in ["OR", "Prev Day", "PM", "Round", "Daily", "Weekly", "Gamma"])
+            or m.startswith("R")
+            for m in near_zone["members"]
         )
-        if is_structural and key_levels:
-            level_price = key_levels.get(near)
-            # Confirm range contraction using existing logic
-            atr_val = calc_atr(bars)
+        if is_structural:
+            # Confirm range contraction
             compression_confirmed = False
             if len(bars) >= 20:
                 avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
                 avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
                 compression_confirmed = avg_prior > 0 and avg_recent < avg_prior * COMPRESSION_RANGE_RATIO
-            if compression_confirmed and level_price and abs(spot - level_price) <= 5:
+            # Spot must be within 5pts of zone boundary
+            near_boundary = abs(spot - near_zone["low"]) <= 5 or abs(spot - near_zone["high"]) <= 5
+            if compression_confirmed and near_boundary:
                 direction = bias if bias != "NEUTRAL" else None
                 return {
                     "type":        "COMPRESSION_SETUP",
                     "bias":        direction or "NEUTRAL",
-                    "level":       near,
-                    "level_price": level_price,
-                    "message":     f"Compression forming near {near} — watch for expansion",
+                    "level":       near_zone["name"],
+                    "level_price": near_zone["mid"],
+                    "level_low":   near_zone["low"],
+                    "level_high":  near_zone["high"],
+                    "message":     f"Compression forming near {near_zone['name']} — watch for expansion",
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
@@ -1345,34 +1410,34 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
         if len(rth_bars) >= 3:
             last3 = rth_bars[-3:]
             # BULL reclaim: was below, now 2+ bars above, net move >= 2pts
-            was_below = last3[0]["c"] < vwap
-            now_above = sum(1 for b in last3[1:] if b["c"] > vwap) >= 2
-            net_reclaim = spot - last3[0]["c"]
+            was_below    = last3[0]["c"] < vwap
+            now_above    = sum(1 for b in last3[1:] if b["c"] > vwap) >= 2
+            net_reclaim  = spot - last3[0]["c"]
             if was_below and now_above and spot > vwap and net_reclaim >= 2.0:
                 return {
-                    "type":    "VWAP_RECLAIM_SETUP",
-                    "bias":    "BULL",
-                    "level":   "VWAP",
+                    "type":        "VWAP_RECLAIM_SETUP",
+                    "bias":        "BULL",
+                    "level":       "VWAP",
                     "level_price": vwap,
-                    "message": f"VWAP reclaim — price accepting above {vwap:,.2f} — potential long continuation",
-                    "spot":    round(spot, 2),
-                    "vwap":    vwap,
-                    "atr":     atr,
+                    "message":     f"VWAP reclaim — price accepting above {vwap:,.2f} — potential long continuation",
+                    "spot":        round(spot, 2),
+                    "vwap":        vwap,
+                    "atr":         atr,
                 }
             # BEAR rejection: was above, now 2+ bars below, net move >= 2pts
-            was_above = last3[0]["c"] > vwap
-            now_below = sum(1 for b in last3[1:] if b["c"] < vwap) >= 2
-            net_rejection = last3[0]["c"] - spot
+            was_above      = last3[0]["c"] > vwap
+            now_below      = sum(1 for b in last3[1:] if b["c"] < vwap) >= 2
+            net_rejection  = last3[0]["c"] - spot
             if was_above and now_below and spot < vwap and net_rejection >= 2.0:
                 return {
-                    "type":    "VWAP_RECLAIM_SETUP",
-                    "bias":    "BEAR",
-                    "level":   "VWAP",
+                    "type":        "VWAP_RECLAIM_SETUP",
+                    "bias":        "BEAR",
+                    "level":       "VWAP",
                     "level_price": vwap,
-                    "message": f"VWAP rejection — price accepting below {vwap:,.2f} — potential short continuation",
-                    "spot":    round(spot, 2),
-                    "vwap":    vwap,
-                    "atr":     atr,
+                    "message":     f"VWAP rejection — price accepting below {vwap:,.2f} — potential short continuation",
+                    "spot":        round(spot, 2),
+                    "vwap":        vwap,
+                    "atr":         atr,
                 }
 
     # ── TREND_CONTINUATION_SETUP — tightened conditions ──────────────────────
@@ -1380,10 +1445,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
         vwap_slope = calc_vwap_slope(vwap_history, n=5)
         slope_aligned = (bias == "BULL" and vwap_slope >= 0.05) or (bias == "BEAR" and vwap_slope <= -0.05)
         vwap_dist = abs(spot - vwap)
-        atr_val = calc_atr(bars)
-        not_extended = vwap_dist <= atr_val * 1.25  # tightened from 1.5
-
-        # Require 12 of last 15 RTH closes on correct side of VWAP
+        atr_val   = calc_atr(bars)
+        not_extended = vwap_dist <= atr_val * 1.25
         rth_bars_tc = [b for b in bars if b.get("t") and
                        datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
         closes_aligned = 0
@@ -1397,26 +1460,22 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                 else:
                     closes_aligned = sum(1 for i, b in enumerate(last15) if b["c"] < hist15[i])
             else:
-                if bias == "BULL":
-                    closes_aligned = sum(1 for b in last15 if b["c"] > vwap)
-                else:
-                    closes_aligned = sum(1 for b in last15 if b["c"] < vwap)
+                closes_aligned = sum(1 for b in last15 if b["c"] > vwap) if bias == "BULL" \
+                                 else sum(1 for b in last15 if b["c"] < vwap)
             net15 = last15[-1]["c"] - last15[0]["c"]
-
         sufficient_closes = closes_aligned >= 12
-        sufficient_move = (bias == "BULL" and net15 >= 8.0) or (bias == "BEAR" and net15 <= -8.0)
-
+        sufficient_move   = (bias == "BULL" and net15 >= 8.0) or (bias == "BEAR" and net15 <= -8.0)
         if slope_aligned and not_extended and sufficient_closes and sufficient_move:
             direction_word = "higher" if bias == "BULL" else "lower"
             return {
-                "type":    "TREND_CONTINUATION_SETUP",
-                "bias":    bias,
-                "level":   "VWAP",
+                "type":        "TREND_CONTINUATION_SETUP",
+                "bias":        bias,
+                "level":       "VWAP",
                 "level_price": vwap,
-                "message": f"Trend continuation — grind {direction_word} | {closes_aligned}/15 bars aligned | net {net15:+.1f}pts",
-                "spot":    round(spot, 2),
-                "vwap":    vwap,
-                "atr":     atr,
+                "message":     f"Trend continuation — grind {direction_word} | {closes_aligned}/15 bars aligned | net {net15:+.1f}pts",
+                "spot":        round(spot, 2),
+                "vwap":        vwap,
+                "atr":         atr,
             }
 
     return None
