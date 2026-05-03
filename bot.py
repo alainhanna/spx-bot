@@ -162,6 +162,26 @@ def get_vix():
                 print(f"[WARN] VIX unavailable: {e}")
     return _vix_cache["value"]
 
+def get_spx_live_price():
+    """
+    Fetch live SPX index value from Polygon indices snapshot.
+    Used for fast-poll mode (15-second interval when setup is active).
+    Endpoint: /v3/snapshot/indices?ticker=I:SPX
+    Returns float price or None on failure.
+    """
+    try:
+        url = f"https://api.polygon.io/v3/snapshot/indices?ticker=I:SPX&apiKey={POLYGON_API_KEY}"
+        r   = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                val = results[0].get("value") or results[0].get("session", {}).get("close")
+                if val:
+                    return float(val)
+    except Exception as e:
+        print(f"[WARN] get_spx_live_price failed: {e}")
+    return None
+
 def get_prev_day_levels():
     for days_back in range(1, 6):
         try:
@@ -1207,6 +1227,388 @@ def evaluate_early_trend_continuation_signal(bars, key_levels, vwap, vwap_histor
     }
 
 # ─────────────────────────────────────────
+# TWO-SPEED SYSTEM — CONTEXT → SETUP → TRIGGER
+# ─────────────────────────────────────────
+
+# Setup alert daily cap
+MAX_SETUPS_PER_DAY = 5
+
+def detect_context(bars, vwap, vwap_history, key_levels):
+    """
+    Derives current market context from existing data.
+    Returns dict: bias, regime, location, near_level.
+    """
+    if not bars or not vwap:
+        return {"bias": "NEUTRAL", "regime": "RANGE", "location": "UNKNOWN", "near_level": None}
+
+    spot       = bars[-1]["c"]
+    atr        = calc_atr(bars)
+    vwap_slope = calc_vwap_slope(vwap_history, n=5)
+
+    # Bias: price vs VWAP + slope
+    if spot > vwap and vwap_slope >= -0.05:
+        bias = "BULL"
+    elif spot < vwap and vwap_slope <= 0.05:
+        bias = "BEAR"
+    else:
+        bias = "NEUTRAL"
+
+    # Regime: TREND / COMPRESSION / RANGE
+    rth_bars = [b for b in bars if b.get("t") and
+                datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+    regime = "RANGE"
+    if len(rth_bars) >= 20:
+        recent20   = rth_bars[-20:]
+        above_vwap = sum(1 for b in recent20 if b["c"] > vwap)
+        net20      = recent20[-1]["c"] - recent20[0]["c"]
+        if above_vwap >= 14 and net20 >= 10:
+            regime = "TREND"
+        elif above_vwap <= 6 and net20 <= -10:
+            regime = "TREND"
+        elif len(bars) >= 20:
+            avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
+            avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
+            if avg_prior > 0 and avg_recent < avg_prior * 0.60:
+                regime = "COMPRESSION"
+
+    # Location: near VWAP or key level
+    location   = "ABOVE_VWAP" if spot > vwap else "BELOW_VWAP"
+    near_level = None
+    if abs(spot - vwap) <= 5:
+        location   = "AT_LEVEL"
+        near_level = "VWAP"
+    elif key_levels:
+        for name, level in key_levels.items():
+            if level and name != "VWAP" and abs(spot - level) <= 5:
+                location   = "AT_LEVEL"
+                near_level = name
+                break
+
+    return {"bias": bias, "regime": regime, "location": location, "near_level": near_level}
+
+
+def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or_low=None):
+    """
+    Detects early structural setups and returns a setup object.
+    Does NOT trigger trades — sends awareness alert only.
+
+    Types:
+      COMPRESSION_SETUP     — range contracting near key level
+      VWAP_RECLAIM_SETUP    — price crossing and holding above/below VWAP
+      TREND_CONTINUATION_SETUP — trend walking above VWAP with shallow pullbacks
+
+    Returns dict with type/bias/level/message/direction or None.
+    """
+    if not bars or not vwap:
+        return None
+
+    spot  = bars[-1]["c"]
+    atr   = calc_atr(bars)
+    bias  = context["bias"]
+    regime = context["regime"]
+
+    # ── COMPRESSION_SETUP — requires real structural level + confirmed range contraction ──
+    if regime == "COMPRESSION":
+        near = context["near_level"]
+        # Must be near a real level — not just VWAP alone
+        structural_levels = {"OR High", "OR Low", "Prev Day High", "Prev Day Low", "PM High", "PM Low"}
+        is_structural = near and near != "VWAP" and (
+            any(s in near for s in ["OR", "Prev Day", "PM", "Round", "Daily", "Weekly", "Gamma"]) or
+            near.startswith("R")
+        )
+        if is_structural and key_levels:
+            level_price = key_levels.get(near)
+            # Confirm range contraction using existing logic
+            atr_val = calc_atr(bars)
+            compression_confirmed = False
+            if len(bars) >= 20:
+                avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
+                avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
+                compression_confirmed = avg_prior > 0 and avg_recent < avg_prior * COMPRESSION_RANGE_RATIO
+            if compression_confirmed and level_price and abs(spot - level_price) <= 5:
+                direction = bias if bias != "NEUTRAL" else None
+                return {
+                    "type":        "COMPRESSION_SETUP",
+                    "bias":        direction or "NEUTRAL",
+                    "level":       near,
+                    "level_price": level_price,
+                    "message":     f"Compression forming near {near} — watch for expansion",
+                    "spot":        round(spot, 2),
+                    "vwap":        vwap,
+                    "atr":         atr,
+                }
+
+    # ── VWAP_RECLAIM_SETUP ───────────────────────────────────────────────────
+    if len(bars) >= 3:
+        rth_bars = [b for b in bars if b.get("t") and
+                    datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+        if len(rth_bars) >= 3:
+            last3 = rth_bars[-3:]
+            # BULL reclaim: was below, now 2+ bars above, net move >= 2pts
+            was_below = last3[0]["c"] < vwap
+            now_above = sum(1 for b in last3[1:] if b["c"] > vwap) >= 2
+            net_reclaim = spot - last3[0]["c"]
+            if was_below and now_above and spot > vwap and net_reclaim >= 2.0:
+                return {
+                    "type":    "VWAP_RECLAIM_SETUP",
+                    "bias":    "BULL",
+                    "level":   "VWAP",
+                    "level_price": vwap,
+                    "message": f"VWAP reclaim — price accepting above {vwap:,.2f} — potential long continuation",
+                    "spot":    round(spot, 2),
+                    "vwap":    vwap,
+                    "atr":     atr,
+                }
+            # BEAR rejection: was above, now 2+ bars below, net move >= 2pts
+            was_above = last3[0]["c"] > vwap
+            now_below = sum(1 for b in last3[1:] if b["c"] < vwap) >= 2
+            net_rejection = last3[0]["c"] - spot
+            if was_above and now_below and spot < vwap and net_rejection >= 2.0:
+                return {
+                    "type":    "VWAP_RECLAIM_SETUP",
+                    "bias":    "BEAR",
+                    "level":   "VWAP",
+                    "level_price": vwap,
+                    "message": f"VWAP rejection — price accepting below {vwap:,.2f} — potential short continuation",
+                    "spot":    round(spot, 2),
+                    "vwap":    vwap,
+                    "atr":     atr,
+                }
+
+    # ── TREND_CONTINUATION_SETUP — tightened conditions ──────────────────────
+    if regime == "TREND" and bias != "NEUTRAL":
+        vwap_slope = calc_vwap_slope(vwap_history, n=5)
+        slope_aligned = (bias == "BULL" and vwap_slope >= 0.05) or (bias == "BEAR" and vwap_slope <= -0.05)
+        vwap_dist = abs(spot - vwap)
+        atr_val = calc_atr(bars)
+        not_extended = vwap_dist <= atr_val * 1.25  # tightened from 1.5
+
+        # Require 12 of last 15 RTH closes on correct side of VWAP
+        rth_bars_tc = [b for b in bars if b.get("t") and
+                       datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+        closes_aligned = 0
+        net15 = 0.0
+        if len(rth_bars_tc) >= 15:
+            last15 = rth_bars_tc[-15:]
+            if len(vwap_history) >= 15:
+                hist15 = vwap_history[-15:]
+                if bias == "BULL":
+                    closes_aligned = sum(1 for i, b in enumerate(last15) if b["c"] > hist15[i])
+                else:
+                    closes_aligned = sum(1 for i, b in enumerate(last15) if b["c"] < hist15[i])
+            else:
+                if bias == "BULL":
+                    closes_aligned = sum(1 for b in last15 if b["c"] > vwap)
+                else:
+                    closes_aligned = sum(1 for b in last15 if b["c"] < vwap)
+            net15 = last15[-1]["c"] - last15[0]["c"]
+
+        sufficient_closes = closes_aligned >= 12
+        sufficient_move = (bias == "BULL" and net15 >= 8.0) or (bias == "BEAR" and net15 <= -8.0)
+
+        if slope_aligned and not_extended and sufficient_closes and sufficient_move:
+            direction_word = "higher" if bias == "BULL" else "lower"
+            return {
+                "type":    "TREND_CONTINUATION_SETUP",
+                "bias":    bias,
+                "level":   "VWAP",
+                "level_price": vwap,
+                "message": f"Trend continuation — grind {direction_word} | {closes_aligned}/15 bars aligned | net {net15:+.1f}pts",
+                "spot":    round(spot, 2),
+                "vwap":    vwap,
+                "atr":     atr,
+            }
+
+    return None
+
+
+def format_setup_message(setup, or_high=None, or_low=None):
+    """Format SETUP awareness alert for Telegram."""
+    emoji = "\U0001f7e1"  # yellow circle = awareness, not trade
+    bias_str = setup["bias"]
+    direction = "LONG" if bias_str == "BULL" else "SHORT" if bias_str == "BEAR" else "WATCH"
+    t = datetime.datetime.now(ET).strftime("%I:%M %p ET")
+
+    # What to watch
+    level = setup.get("level", "")
+    level_price = setup.get("level_price")
+    watch_str = f"{level} ({level_price:,.2f})" if level_price else level
+
+    msg = (
+        f"{emoji} *SETUP: {setup['type']}*\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"*Direction:* {direction}\n"
+        f"*Watch:*     {watch_str}\n"
+        f"*Time:*      {t}\n"
+        f"*SPX:*       {setup['spot']:,.2f} | VWAP: {setup['vwap']:,.2f}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"{setup['message']}\n"
+        f"_No trade yet — waiting for trigger confirmation_"
+    )
+    return msg
+
+
+def build_synthetic_bar(ticks):
+    """
+    Build a synthetic OHLC bar from a list of (timestamp, price) tuples.
+    Includes tick_count so trigger engine knows if wick data is reliable.
+    Returns bar dict compatible with existing engines.
+    """
+    if not ticks:
+        return None
+    prices = [p for _, p in ticks]
+    return {
+        "o":          prices[0],
+        "h":          max(prices),
+        "l":          min(prices),
+        "c":          prices[-1],
+        "v":          1,
+        "t":          int(ticks[-1][0] * 1000),
+        "tick_count": len(ticks),
+    }
+
+
+def detect_fast_trigger(synth_bars, setup, atr, vwap, setup_start_time, now_et, synthetic_ticks=None):
+    """
+    Fast trigger engine. Two-tier:
+
+    PRIMARY — raw tick acceleration (fires without waiting for 3 synthetic bars):
+      BULL: price_now - price_30s_ago >= 2.0 AND price_now - price_60s_ago >= 3.0
+      BEAR: inverse
+      + anti-chase limits still apply
+
+    SECONDARY — synthetic bar quality check (optional wick filter):
+      Only applies wick rejection if synth bar has tick_count >= 3.
+
+    10-minute time limit, 1.5 ATR anti-chase, anti-extension enforced.
+    """
+    if not setup:
+        return None
+
+    bias         = setup["bias"]
+    setup_origin = setup.get("spot", 0)
+    atr_val      = atr or 5.0
+
+    # Time limit: trigger must occur within 10 minutes of setup
+    if setup_start_time and (now_et - setup_start_time).total_seconds() > 600:
+        return None
+
+    # ── PRIMARY: raw tick-window trigger ─────────────────────────────────────
+    if synthetic_ticks and len(synthetic_ticks) >= 2:
+        now_ts    = now_et.timestamp()
+        price_now = synthetic_ticks[-1][1]
+
+        # Anti-chase pre-check
+        if vwap and abs(price_now - vwap) > 15.0:
+            pass  # fall through to synthetic bar check
+        elif atr_val and abs(price_now - setup_origin) > atr_val * 1.5:
+            pass  # fall through
+        else:
+            # Find price 30s and 60s ago
+            price_30s = next((p for ts, p in reversed(synthetic_ticks) if now_ts - ts >= 30), None)
+            price_60s = next((p for ts, p in reversed(synthetic_ticks) if now_ts - ts >= 60), None)
+
+            bull_trigger = (
+                price_30s is not None and price_now - price_30s >= 2.0 and
+                (price_60s is None or price_now - price_60s >= 3.0)
+            )
+            bear_trigger = (
+                price_30s is not None and price_30s - price_now >= 2.0 and
+                (price_60s is None or price_60s - price_now >= 3.0)
+            )
+
+            triggered = (bias == "BULL" and bull_trigger) or (bias == "BEAR" and bear_trigger)
+            if triggered:
+                net_raw = price_now - (price_30s or price_now)
+                return {
+                    "confirmed":    True,
+                    "bias":         bias,
+                    "spot":         round(price_now, 2),
+                    "net3":         round(net_raw, 2),
+                    "accelerating": True,
+                    "setup_type":   setup["type"],
+                    "trigger_mode": "RAW_TICK",
+                }
+
+    # ── SECONDARY: synthetic bar trigger (quality check) ─────────────────────
+    if not synth_bars or len(synth_bars) < 3:
+        return None
+
+    spot = synth_bars[-1]["c"]
+    net3 = synth_bars[-1]["c"] - synth_bars[-3]["c"]
+
+    if bias == "BULL" and net3 < 2.0:
+        return None
+    if bias == "BEAR" and net3 > -2.0:
+        return None
+
+    if vwap and abs(spot - vwap) > 15.0:
+        return None
+    if vwap and atr_val and abs(spot - vwap) > atr_val * 1.5:
+        return None
+    if atr_val and abs(spot - setup_origin) > atr_val * 1.5:
+        return None
+
+    # Wick check only if bar has enough ticks
+    bar = synth_bars[-1]
+    tick_count = bar.get("tick_count", 1)
+    if tick_count >= 3:
+        br = bar["h"] - bar["l"]
+        if br > 0.5:
+            if bias == "BULL" and (bar["h"] - bar["c"]) / br > 0.45:
+                return None
+            if bias == "BEAR" and (bar["c"] - bar["l"]) / br > 0.45:
+                return None
+
+    net_last  = synth_bars[-1]["c"] - synth_bars[-2]["c"]
+    net_prior = synth_bars[-2]["c"] - synth_bars[-3]["c"]
+    accelerating = (bias == "BULL" and net_last > 0 and net_last >= net_prior) or \
+                   (bias == "BEAR" and net_last < 0 and net_last <= net_prior)
+
+    return {
+        "confirmed":    True,
+        "bias":         bias,
+        "spot":         round(spot, 2),
+        "net3":         round(net3, 2),
+        "accelerating": accelerating,
+        "setup_type":   setup["type"],
+        "trigger_mode": "SYNTH_BAR",
+    }
+
+
+def format_trigger_message(trigger, setup, closed_bars, vwap, vix, session, atr):
+    """Format TRIGGER tradeable alert with strike suggestion."""
+    t     = datetime.datetime.now(ET).strftime("%I:%M %p ET")
+    bias  = trigger["bias"]
+    spot  = trigger["spot"]
+    emoji = "\U0001f7e2" if bias == "BULL" else "\U0001f534"
+    regime = get_regime(vix)
+
+    exits = build_exit_params(session, regime, atr, bias, spot, vwap)
+    vix_str  = f"{vix:.1f}" if vix else "N/A"
+    vwap_str = f"{vwap:,.2f}" if vwap else "N/A"
+
+    mode_str = "raw tick acceleration" if trigger.get("trigger_mode") == "RAW_TICK" else "over fast window"
+    msg = (
+        f"{emoji} *TRIGGER: {trigger['setup_type']}*\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"*{exits['option_type']} 0DTE* | Confirmed\n"
+        f"*Time:*     {t}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"*Spot:*     {spot:,.2f}\n"
+        f"*Strike:*   {exits['strike']} {exits['option_type']} 0DTE\n"
+        f"*VWAP:*     {vwap_str}\n"
+        f"*Micro-mom:* {trigger['net3']:+.1f}pts via {mode_str}\n"
+        f"*VIX:*      {vix_str}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"*T1:* {exits['target_1']:,.2f}  |  *T2:* {exits['target_2']:,.2f}\n"
+        f"*Stop:* -{exits['stop_pct']}% premium  |  SPX {exits['invalidate']:,.2f}\n"
+        f"*No chase:* past {exits['no_chase']:,.2f}\n"
+        f"*Exit by:* 3:45 PM ET"
+    )
+    return msg
+
+# ─────────────────────────────────────────
 # COMBINED EVALUATOR
 # ─────────────────────────────────────────
 def evaluate_signal(bars, key_levels, vwap, vwap_history, vix, session,
@@ -1486,6 +1888,12 @@ def main():
     vwap_history      = []
     last_bar_time     = None
     levels_loaded     = False
+    # Two-speed system state
+    active_setup         = None    # current setup object or None
+    setup_count          = 0       # daily setup alert counter
+    last_setup_type_time = {}      # {setup_type: datetime} — prevents spam
+    synthetic_ticks      = []      # rolling list of (ts, price) for fast-poll bars
+    trigger_fired        = False   # prevent duplicate trigger for same setup
 
     while True:
         now_et = datetime.datetime.now(ET)
@@ -1511,6 +1919,11 @@ def main():
             vwap_history      = []
             last_bar_time     = None
             levels_loaded     = False
+            active_setup         = None
+            setup_count          = 0
+            last_setup_type_time = {}
+            synthetic_ticks      = []
+            trigger_fired        = False
             print(f"\n[{now_et.strftime('%H:%M ET')}] New day - reset.")
 
         if is_premarket() and not premarket_sent and now_et.hour >= 6:
@@ -1666,6 +2079,43 @@ def main():
                 elif len(closed_bars) < 20:
                     print(f"  -> Warming up ({len(closed_bars)}/20 closed bars)")
                 else:
+                    # ── TWO-SPEED: CONTEXT + SETUP DETECTION (1-min bars) ─────
+                    if now_et.time() >= datetime.time(9, 45):
+                        ctx = detect_context(closed_bars, closed_vwap, vwap_history, key_levels)
+                        print(f"  [CTX] bias={ctx['bias']} regime={ctx['regime']} location={ctx['location']} near={ctx['near_level']}")
+
+                        # Setup lifecycle: clear if bias flipped across VWAP
+                        if active_setup and closed_vwap:
+                            setup_bias  = active_setup["bias"]
+                            spot_closed = closed_bars[-1]["c"]
+                            if setup_bias == "BULL" and spot_closed < closed_vwap:
+                                print(f"  [SETUP] cleared — price crossed below VWAP")
+                                active_setup = None; trigger_fired = False
+                            elif setup_bias == "BEAR" and spot_closed > closed_vwap:
+                                print(f"  [SETUP] cleared — price crossed above VWAP")
+                                active_setup = None; trigger_fired = False
+
+                        if setup_count < MAX_SETUPS_PER_DAY and not active_setup:
+                            new_setup = detect_setup(ctx, closed_bars, closed_vwap, vwap_history, key_levels,
+                                                     or_high=or_high, or_low=or_low)
+                            if new_setup:
+                                # Deduplicate on (type, bias, level) key
+                                setup_key  = (new_setup["type"], new_setup["bias"], new_setup.get("level"))
+                                last_fired = last_setup_type_time.get(setup_key)
+                                if not last_fired or (now_et - last_fired).total_seconds() > 1200:
+                                    new_setup["start_time"] = now_et
+                                    active_setup  = new_setup
+                                    trigger_fired = False
+                                    synthetic_ticks = []
+                                    setup_count  += 1
+                                    last_setup_type_time[setup_key] = now_et
+                                    send_telegram(format_setup_message(new_setup, or_high=or_high, or_low=or_low))
+                                    print(f"  [SETUP] {new_setup['type']} | {new_setup['bias']} | {new_setup['message']}")
+                                else:
+                                    mins = int((now_et - last_fired).total_seconds() / 60)
+                                    print(f"  [SETUP] suppressed — same setup fired {mins}min ago")
+
+                    # ── EXISTING SIGNAL ENGINES (unchanged) ───────────────────
                     sig = evaluate_signal(
                         closed_bars, key_levels, closed_vwap, vwap_history, vix, session,
                         last_signal_time, last_signal_price, last_signal_bias, or_set,
@@ -1682,8 +2132,103 @@ def main():
                         print(f"  -> SIGNAL [{sig['signal_type']}]: {sig['trigger']} | {sig['bias']} | score={sig['score']}")
                     else:
                         print(f"  -> No signal this bar")
+
             elif not new_bar:
                 print(f"  -> Same bar - skipping")
+
+            # ── FAST MODE — runs every 15s independently of bar gate ──────────
+            # This path is always evaluated when a setup is active,
+            # regardless of whether a new 1-minute bar printed.
+            if active_setup and not trigger_fired and now_et.time() <= datetime.time(15, 30):
+
+                setup_start = active_setup.get("start_time")
+                atr_val     = calc_atr(closed_bars) if closed_bars else 5.0
+
+                # Lifecycle: expire setup after 10 minutes
+                if setup_start and (now_et - setup_start).total_seconds() > 600:
+                    print(f"  [FAST] setup expired after 10 min — clearing")
+                    active_setup = None
+                    trigger_fired = False
+
+                else:
+                    live_price = get_spx_live_price()
+                    if live_price:
+                        level_price  = active_setup.get("level_price")
+                        setup_origin = active_setup.get("spot", live_price)
+
+                        # Lifecycle: clear if bias flipped across VWAP (fast mode check)
+                        if closed_vwap and active_setup:
+                            setup_bias = active_setup["bias"]
+                            if setup_bias == "BULL" and live_price < closed_vwap:
+                                print(f"  [FAST] setup cleared — live price crossed below VWAP")
+                                active_setup = None; trigger_fired = False
+                            elif setup_bias == "BEAR" and live_price > closed_vwap:
+                                print(f"  [FAST] setup cleared — live price crossed above VWAP")
+                                active_setup = None; trigger_fired = False
+
+                        # Lifecycle: clear if price moves >20pts from setup level
+                        if level_price and abs(live_price - level_price) > 20:
+                            print(f"  [FAST] setup cleared — price {live_price:,.2f} drifted >20pts from {level_price:,.2f}")
+                            active_setup = None; trigger_fired = False
+
+                        # Anti-chase pre-check before adding ticks
+                        elif closed_vwap and abs(live_price - closed_vwap) > 15:
+                            print(f"  [FAST] anti-chase: {abs(live_price - closed_vwap):.1f}pts from VWAP — not collecting ticks")
+
+                        elif atr_val and abs(live_price - setup_origin) > atr_val * 1.5:
+                            print(f"  [FAST] anti-chase: moved {abs(live_price - setup_origin):.1f}pts from origin — clearing setup")
+                            active_setup = None; trigger_fired = False
+
+                        else:
+                            # Collect tick
+                            ts = now_et.timestamp()
+                            synthetic_ticks.append((ts, live_price))
+                            # Keep rolling 3-minute window
+                            cutoff = ts - 180
+                            synthetic_ticks = [(t, p) for t, p in synthetic_ticks if t >= cutoff]
+
+                            # Build 45-second synthetic bars (need 3+ ticks per bar for reliable wicks)
+                            synth_bars  = []
+                            bucket_size = 45  # seconds
+                            if len(synthetic_ticks) >= 2:
+                                start_ts = synthetic_ticks[0][0]
+                                bucket   = []
+                                for tick_ts, tick_p in synthetic_ticks:
+                                    if tick_ts - start_ts < bucket_size:
+                                        bucket.append((tick_ts, tick_p))
+                                    else:
+                                        bar = build_synthetic_bar(bucket)
+                                        if bar:
+                                            synth_bars.append(bar)
+                                        bucket   = [(tick_ts, tick_p)]
+                                        start_ts = tick_ts
+                                if bucket:
+                                    bar = build_synthetic_bar(bucket)
+                                    if bar:
+                                        synth_bars.append(bar)
+
+                            print(f"  [FAST] live={live_price:,.2f} ticks={len(synthetic_ticks)} synth_bars={len(synth_bars)}")
+
+                            if len(synth_bars) >= 3 or len(synthetic_ticks) >= 4:
+                                trig = detect_fast_trigger(
+                                    synth_bars, active_setup, atr_val, closed_vwap,
+                                    setup_start_time=setup_start, now_et=now_et,
+                                    synthetic_ticks=synthetic_ticks
+                                )
+                                if trig:
+                                    # Store setup before clearing
+                                    trigger_setup = active_setup
+                                    trigger_fired = True
+                                    active_setup  = None
+                                    synthetic_ticks = []
+                                    alert_count  += 1
+                                    msg = format_trigger_message(
+                                        trig, trigger_setup, closed_bars,
+                                        closed_vwap, vix, session, atr_val
+                                    )
+                                    send_telegram(msg)
+                                    print(f"  [TRIGGER] {trig['setup_type']} | {trig['bias']} | mode={trig.get('trigger_mode','?')} | net={trig['net3']:+.1f}pts @ {live_price:,.2f}")
+
 
         else:
             print(f"[{now_et.strftime('%H:%M ET')}] Market closed.")
