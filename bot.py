@@ -1287,60 +1287,141 @@ def detect_context(bars, vwap, vwap_history, key_levels):
     return {"bias": bias, "regime": regime, "location": location, "near_level": near_level}
 
 
-def cluster_levels(key_levels, proximity=5.0):
+# Priority zone widths
+PRIORITY_ZONE_WIDTH = {"HIGH": 6, "MEDIUM": 4, "LOW": 3}
+
+
+def parse_levels(raw_levels):
     """
-    Group key levels within proximity pts of each other into zones.
-    Returns list of zone dicts: {name, low, high, mid, members}
-    Used by detect_setup to avoid firing separate alerts per level in the same cluster.
+    Parse MANUAL_LEVELS which may be:
+      - New format: {name: (price, priority)}
+      - Legacy format: {name: price}
+
+    Returns {name: {"price": float, "priority": str}}
+    """
+    parsed = {}
+    for name, val in raw_levels.items():
+        if isinstance(val, tuple):
+            price, priority = val[0], val[1]
+        else:
+            price    = float(val)
+            # Infer priority from name
+            if any(s in name for s in ["Daily 1SD", "Weekly 1SD", "ATH VWAP", "WTD VWAP"]):
+                priority = "HIGH"
+            elif any(s in name for s in ["Gamma", "Yearly", "Monthly"]):
+                priority = "LOW"
+            else:
+                priority = "MEDIUM"
+        parsed[name] = {"price": float(price), "priority": priority}
+    return parsed
+
+
+def filter_vwap_levels(parsed_levels, spot):
+    """
+    Keep only the 2 closest VWAP-type levels above spot and 2 below.
+    Non-VWAP levels are kept unchanged.
+    Reduces VWAP noise in level dict.
+    """
+    vwap_names  = [n for n in parsed_levels if "VWAP" in n and n != "VWAP"]
+    other_names = [n for n in parsed_levels if "VWAP" not in n or n == "VWAP"]
+
+    above = sorted([n for n in vwap_names if parsed_levels[n]["price"] > spot],
+                   key=lambda n: parsed_levels[n]["price"])[:2]
+    below = sorted([n for n in vwap_names if parsed_levels[n]["price"] <= spot],
+                   key=lambda n: parsed_levels[n]["price"], reverse=True)[:2]
+
+    keep = set(other_names) | set(above) | set(below)
+    return {n: parsed_levels[n] for n in keep if n in parsed_levels}
+
+
+def cluster_levels(key_levels, proximity=5.0, parsed=None):
+    """
+    Group levels within proximity pts into zones.
+    Uses parsed level data for priority and dynamic zone widths.
+    Returns list of zone dicts:
+      {name, low, high, mid, members, priority, role, zone_width}
+
+    priority = highest priority among members (HIGH > MEDIUM > LOW)
+    role     = SUPPORT if spot > zone.mid, else RESISTANCE
     """
     if not key_levels:
         return []
 
-    # Sort non-None levels by price
-    sorted_levels = sorted(
-        [(name, price) for name, price in key_levels.items()
-         if price is not None and name != "VWAP"],
-        key=lambda x: x[1]
-    )
+    priority_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+    # Build flat list of (name, price, priority)
+    items = []
+    for name, val in key_levels.items():
+        if name == "VWAP":
+            continue
+        if parsed and name in parsed:
+            price    = parsed[name]["price"]
+            priority = parsed[name]["priority"]
+        elif isinstance(val, tuple):
+            price, priority = float(val[0]), val[1]
+        elif val is not None:
+            price    = float(val)
+            priority = "MEDIUM"
+        else:
+            continue
+        items.append((name, price, priority))
+
+    items.sort(key=lambda x: x[1])
 
     zones = []
     i = 0
-    while i < len(sorted_levels):
-        name, price = sorted_levels[i]
-        cluster_names  = [name]
-        cluster_prices = [price]
+    while i < len(items):
+        name, price, priority = items[i]
+        cluster = [(name, price, priority)]
         j = i + 1
-        while j < len(sorted_levels) and sorted_levels[j][1] - cluster_prices[0] <= proximity:
-            cluster_names.append(sorted_levels[j][0])
-            cluster_prices.append(sorted_levels[j][1])
+        while j < len(items) and items[j][1] - cluster[0][1] <= proximity:
+            cluster.append(items[j])
             j += 1
-        low  = min(cluster_prices)
-        high = max(cluster_prices)
+        prices     = [c[1] for c in cluster]
+        priorities = [c[2] for c in cluster]
+        top_priority = max(priorities, key=lambda p: priority_rank.get(p, 0))
+        low  = min(prices)
+        high = max(prices)
         mid  = round((low + high) / 2, 2)
-        if len(cluster_names) > 1:
-            label = f"Zone {low:.0f}–{high:.0f}"
-        else:
-            label = cluster_names[0]
+        zone_width = PRIORITY_ZONE_WIDTH.get(top_priority, 4)
+        label = f"Zone {low:.0f}–{high:.0f}" if len(cluster) > 1 else cluster[0][0]
         zones.append({
-            "name":    label,
-            "low":     low,
-            "high":    high,
-            "mid":     mid,
-            "members": cluster_names,
+            "name":       label,
+            "low":        low,
+            "high":       high,
+            "mid":        mid,
+            "members":    [c[0] for c in cluster],
+            "priority":   top_priority,
+            "zone_width": zone_width,
         })
         i = j
     return zones
 
 
-def find_nearest_zone(spot, zones, proximity=8.0):
-    """Return the nearest zone within proximity pts of spot, or None."""
-    nearest = None
-    nearest_dist = float("inf")
+def assign_zone_roles(zones, spot):
+    """Add role (SUPPORT/RESISTANCE) to each zone based on spot price."""
     for zone in zones:
+        zone["role"] = "SUPPORT" if spot > zone["mid"] else "RESISTANCE"
+    return zones
+
+
+def find_nearest_zone(spot, zones, min_priority="MEDIUM"):
+    """
+    Return nearest zone within its own zone_width of spot.
+    Filters by minimum priority: HIGH only, or HIGH+MEDIUM, or all.
+    Ignores LOW zones unless min_priority="LOW".
+    """
+    priority_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+    min_rank      = priority_rank.get(min_priority, 2)
+    nearest       = None
+    nearest_dist  = float("inf")
+    for zone in zones:
+        if priority_rank.get(zone["priority"], 0) < min_rank:
+            continue
         dist = min(abs(spot - zone["low"]), abs(spot - zone["high"]), abs(spot - zone["mid"]))
-        if dist <= proximity and dist < nearest_dist:
+        if dist <= zone["zone_width"] and dist < nearest_dist:
             nearest_dist = dist
-            nearest = zone
+            nearest      = zone
     return nearest
 
 
@@ -1350,12 +1431,16 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
     Does NOT trigger trades — sends awareness alert only.
 
     Types:
-      COMPRESSION_SETUP        — range contracting near key level/zone
+      COMPRESSION_SETUP        — range contracting near HIGH/MEDIUM zone
       VWAP_RECLAIM_SETUP       — price crossing and holding above/below VWAP
       TREND_CONTINUATION_SETUP — trend walking above VWAP with shallow pullbacks
 
-    Level clustering: levels within 5pts are treated as a single zone.
-    Only one setup alert fires per zone (dedup by zone name in evaluate_signal).
+    Level handling:
+      - Parses (price, priority) format from levels.py
+      - Filters VWAP levels to 2 above + 2 below spot
+      - Clusters remaining levels into zones with priority-based widths
+      - Only allows COMPRESSION_SETUP near HIGH or MEDIUM zones
+      - Zone role (SUPPORT/RESISTANCE) informs setup bias
 
     Returns dict with type/bias/level/message/direction or None.
     """
@@ -1367,37 +1452,46 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
     bias   = context["bias"]
     regime = context["regime"]
 
-    # Build clustered zones from key_levels
-    zones = cluster_levels(key_levels, proximity=5.0)
+    # Parse and filter levels
+    parsed   = parse_levels(key_levels) if key_levels else {}
+    filtered = filter_vwap_levels(parsed, spot)
 
-    # ── COMPRESSION_SETUP — requires real structural zone + confirmed range contraction ──
+    # Build flat price dict for backward compat with existing engines
+    flat_levels = {n: v["price"] for n, v in filtered.items()}
+
+    # Cluster and assign roles
+    zones = cluster_levels(flat_levels, proximity=5.0, parsed=filtered)
+    zones = assign_zone_roles(zones, spot)
+
+    # ── COMPRESSION_SETUP — HIGH/MEDIUM zone + confirmed range contraction ───
     if regime == "COMPRESSION":
-        # Find nearest zone to spot
-        near_zone = find_nearest_zone(spot, zones, proximity=8.0)
-        is_structural = near_zone and any(
-            any(s in m for s in ["OR", "Prev Day", "PM", "Round", "Daily", "Weekly", "Gamma"])
-            or m.startswith("R")
-            for m in near_zone["members"]
-        )
-        if is_structural:
-            # Confirm range contraction
+        near_zone = find_nearest_zone(spot, zones, min_priority="MEDIUM")
+        if near_zone:
             compression_confirmed = False
             if len(bars) >= 20:
                 avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
                 avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
                 compression_confirmed = avg_prior > 0 and avg_recent < avg_prior * COMPRESSION_RANGE_RATIO
-            # Spot must be within 5pts of zone boundary
-            near_boundary = abs(spot - near_zone["low"]) <= 5 or abs(spot - near_zone["high"]) <= 5
+            # Spot within zone_width of boundary
+            near_boundary = (abs(spot - near_zone["low"]) <= near_zone["zone_width"] or
+                             abs(spot - near_zone["high"]) <= near_zone["zone_width"])
             if compression_confirmed and near_boundary:
-                direction = bias if bias != "NEUTRAL" else None
+                # Bias from zone role: SUPPORT → BULL, RESISTANCE → BEAR
+                role_bias = "BULL" if near_zone["role"] == "SUPPORT" else "BEAR"
+                direction = role_bias if bias == "NEUTRAL" else bias
                 return {
                     "type":        "COMPRESSION_SETUP",
-                    "bias":        direction or "NEUTRAL",
+                    "bias":        direction,
                     "level":       near_zone["name"],
                     "level_price": near_zone["mid"],
                     "level_low":   near_zone["low"],
                     "level_high":  near_zone["high"],
-                    "message":     f"Compression forming near {near_zone['name']} — watch for expansion",
+                    "zone_width":  near_zone["zone_width"],
+                    "role":        near_zone["role"],
+                    "priority":    near_zone["priority"],
+                    "message":     (f"Compression near {near_zone['name']} "
+                                   f"[{near_zone['priority']}] — "
+                                   f"{near_zone['role']} zone — watch for expansion"),
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
@@ -1409,59 +1503,69 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                     datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
         if len(rth_bars) >= 3:
             last3 = rth_bars[-3:]
-            # BULL reclaim: was below, now 2+ bars above, net move >= 2pts
-            was_below    = last3[0]["c"] < vwap
-            now_above    = sum(1 for b in last3[1:] if b["c"] > vwap) >= 2
-            net_reclaim  = spot - last3[0]["c"]
+            was_below   = last3[0]["c"] < vwap
+            now_above   = sum(1 for b in last3[1:] if b["c"] > vwap) >= 2
+            net_reclaim = spot - last3[0]["c"]
             if was_below and now_above and spot > vwap and net_reclaim >= 2.0:
                 return {
                     "type":        "VWAP_RECLAIM_SETUP",
                     "bias":        "BULL",
                     "level":       "VWAP",
                     "level_price": vwap,
-                    "message":     f"VWAP reclaim — price accepting above {vwap:,.2f} — potential long continuation",
+                    "level_low":   vwap,
+                    "level_high":  vwap,
+                    "zone_width":  4,
+                    "role":        "SUPPORT",
+                    "priority":    "HIGH",
+                    "message":     f"VWAP reclaim — accepting above {vwap:,.2f} — potential long continuation",
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
                 }
-            # BEAR rejection: was above, now 2+ bars below, net move >= 2pts
-            was_above      = last3[0]["c"] > vwap
-            now_below      = sum(1 for b in last3[1:] if b["c"] < vwap) >= 2
-            net_rejection  = last3[0]["c"] - spot
+            was_above     = last3[0]["c"] > vwap
+            now_below     = sum(1 for b in last3[1:] if b["c"] < vwap) >= 2
+            net_rejection = last3[0]["c"] - spot
             if was_above and now_below and spot < vwap and net_rejection >= 2.0:
                 return {
                     "type":        "VWAP_RECLAIM_SETUP",
                     "bias":        "BEAR",
                     "level":       "VWAP",
                     "level_price": vwap,
-                    "message":     f"VWAP rejection — price accepting below {vwap:,.2f} — potential short continuation",
+                    "level_low":   vwap,
+                    "level_high":  vwap,
+                    "zone_width":  4,
+                    "role":        "RESISTANCE",
+                    "priority":    "HIGH",
+                    "message":     f"VWAP rejection — accepting below {vwap:,.2f} — potential short continuation",
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
                 }
 
-    # ── TREND_CONTINUATION_SETUP — tightened conditions ──────────────────────
+    # ── TREND_CONTINUATION_SETUP ──────────────────────────────────────────────
     if regime == "TREND" and bias != "NEUTRAL":
-        vwap_slope = calc_vwap_slope(vwap_history, n=5)
+        vwap_slope    = calc_vwap_slope(vwap_history, n=5)
         slope_aligned = (bias == "BULL" and vwap_slope >= 0.05) or (bias == "BEAR" and vwap_slope <= -0.05)
-        vwap_dist = abs(spot - vwap)
-        atr_val   = calc_atr(bars)
-        not_extended = vwap_dist <= atr_val * 1.25
-        rth_bars_tc = [b for b in bars if b.get("t") and
-                       datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
+        vwap_dist     = abs(spot - vwap)
+        not_extended  = vwap_dist <= calc_atr(bars) * 1.25
+        rth_tc = [b for b in bars if b.get("t") and
+                  datetime.datetime.fromtimestamp(b["t"] / 1000, ET).time() >= datetime.time(9, 30)]
         closes_aligned = 0
         net15 = 0.0
-        if len(rth_bars_tc) >= 15:
-            last15 = rth_bars_tc[-15:]
+        if len(rth_tc) >= 15:
+            last15 = rth_tc[-15:]
             if len(vwap_history) >= 15:
                 hist15 = vwap_history[-15:]
-                if bias == "BULL":
-                    closes_aligned = sum(1 for i, b in enumerate(last15) if b["c"] > hist15[i])
-                else:
-                    closes_aligned = sum(1 for i, b in enumerate(last15) if b["c"] < hist15[i])
+                closes_aligned = sum(
+                    1 for i, b in enumerate(last15)
+                    if (bias == "BULL" and b["c"] > hist15[i]) or
+                       (bias == "BEAR" and b["c"] < hist15[i])
+                )
             else:
-                closes_aligned = sum(1 for b in last15 if b["c"] > vwap) if bias == "BULL" \
-                                 else sum(1 for b in last15 if b["c"] < vwap)
+                closes_aligned = sum(
+                    1 for b in last15
+                    if (bias == "BULL" and b["c"] > vwap) or (bias == "BEAR" and b["c"] < vwap)
+                )
             net15 = last15[-1]["c"] - last15[0]["c"]
         sufficient_closes = closes_aligned >= 12
         sufficient_move   = (bias == "BULL" and net15 >= 8.0) or (bias == "BEAR" and net15 <= -8.0)
@@ -1472,7 +1576,13 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                 "bias":        bias,
                 "level":       "VWAP",
                 "level_price": vwap,
-                "message":     f"Trend continuation — grind {direction_word} | {closes_aligned}/15 bars aligned | net {net15:+.1f}pts",
+                "level_low":   vwap,
+                "level_high":  vwap,
+                "zone_width":  4,
+                "role":        "SUPPORT" if bias == "BULL" else "RESISTANCE",
+                "priority":    "HIGH",
+                "message":     (f"Trend continuation — grind {direction_word} | "
+                               f"{closes_aligned}/15 bars aligned | net {net15:+.1f}pts"),
                 "spot":        round(spot, 2),
                 "vwap":        vwap,
                 "atr":         atr,
@@ -1575,6 +1685,14 @@ def detect_fast_trigger(synth_bars, setup, atr, vwap, setup_start_time, now_et, 
                 price_30s is not None and price_30s - price_now >= 2.0 and
                 (price_60s is None or price_60s - price_now >= 3.0)
             )
+
+            # Zone boundary check: require clean break of zone boundary, not just midpoint
+            zone_high = setup.get("level_high", setup.get("level_price", price_now))
+            zone_low  = setup.get("level_low",  setup.get("level_price", price_now))
+            if bias == "BULL":
+                bull_trigger = bull_trigger and price_now > zone_high
+            if bias == "BEAR":
+                bear_trigger = bear_trigger and price_now < zone_low
 
             triggered = (bias == "BULL" and bull_trigger) or (bias == "BEAR" and bear_trigger)
             if triggered:
@@ -1999,10 +2117,12 @@ def main():
             try:
                 import importlib, levels as lvl_mod
                 importlib.reload(lvl_mod)
-                for name, price in lvl_mod.MANUAL_LEVELS.items():
-                    key_levels[name] = price
+                raw = lvl_mod.MANUAL_LEVELS
+                parsed_manual = parse_levels(raw)
+                for name, meta in parsed_manual.items():
+                    key_levels[name] = meta["price"]  # flat price for existing engines
                 levels_loaded = True
-                print(f"[LEVELS] {len(lvl_mod.MANUAL_LEVELS)} manual levels loaded from levels.py")
+                print(f"[LEVELS] {len(parsed_manual)} manual levels loaded from levels.py")
             except Exception as e:
                 levels_loaded = False
                 print(f"[ERROR] levels.py failed to load: {e}")

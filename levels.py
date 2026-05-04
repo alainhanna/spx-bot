@@ -2,34 +2,35 @@
 # levels.py — SPX key levels for today
 # Update this file each morning and upload to GitHub
 # bot.py imports MANUAL_LEVELS automatically
+#
+# Format: "Level Name": (price, "PRIORITY")
+# Priorities: HIGH, MEDIUM, LOW
+#   HIGH   — Daily 1SD, major VWAPs (ATH, WTD)        → zone width 6pts
+#   MEDIUM — Prior session VWAPs, round numbers        → zone width 4pts
+#   LOW    — Distant levels (gamma flip, yearly bands) → zone width 3pts
 # ─────────────────────────────────────────
 
-# Date: May 1, 2026
+# Date: Monday May 4, 2026
 # Source: Godzilla Trader / GT level map
+# Pre-market spot: ~7,325 (gap up)
 
 MANUAL_LEVELS = {
-    # Expected moves — SPX at ~7,222
-    "Daily 1SD Upper 7250":    7250.0,   # Bull target — right above price
-    "Daily 1SD Lower 7168":    7168.0,   # Bear line / key support
-    "Weekly 1SD Upper 7295":   7295.0,   # Weekly upper
-    "Weekly 1SD Lower 7035":   7035.0,   # Weekly lower
-    "5 DMA 7164":              7164.0,   # 5-day MA — support below
+    # HIGH — structural + major VWAPs
+    "Daily 1SD Upper 7279":  (7279.0,   "HIGH"),
+    "Daily 1SD Lower 7181":  (7181.0,   "HIGH"),
+    "5 DMA 7177":            (7177.0,   "HIGH"),
+    "ATH VWAP 7246":         (7246.69,  "HIGH"),
+    "WTD VWAP 7173":         (7173.43,  "HIGH"),
 
-    # VWAP cluster — top 2 only
-    "ATH VWAP 7212":           7212.60,  # ATH VWAP — just below price
-    "WTD VWAP 7209":           7209.02,  # WTD VWAP
+    # MEDIUM — prior session VWAPs + round numbers
+    "VWAP 7230":             (7230.11,  "MEDIUM"),
+    "VWAP 7212":             (7212.51,  "MEDIUM"),
+    "Round 7300":            (7300.0,   "MEDIUM"),
+    "Round 7200":            (7200.0,   "MEDIUM"),
 
-    # Prior session VWAPs — 2 most relevant
-    "VWAP 7186":               7186.94,  # Prior session
-    "VWAP 7155":               7155.71,  # Prior session support
+    # MEDIUM — weekly structure
+    "Weekly 1SD Lower 7122": (7122.0,   "MEDIUM"),
 
-    # Gamma flip
-    "Gamma Flip 7017":         7017.0,   # Major structural level
-
-    # Round numbers
-    "Round 7200":              7200.0,
-    "Round 7300":              7300.0,
+    # LOW — far levels
+    "Gamma Flip 6957":       (6957.0,   "LOW"),
 }
-
-
-
