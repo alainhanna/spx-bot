@@ -1288,7 +1288,13 @@ def detect_context(bars, vwap, vwap_history, key_levels):
 
 
 # Priority zone widths
-PRIORITY_ZONE_WIDTH = {"HIGH": 6, "MEDIUM": 4, "LOW": 3}
+PRIORITY_ZONE_WIDTH  = {"HIGH": 6, "MEDIUM": 4, "LOW": 3}
+PRIORITY_WEIGHT      = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+CLUSTER_WINDOW       = 15.0   # pts — group levels within this range into a cluster
+PROXIMITY_FILTER     = 25.0   # pts — ignore levels outside ±this from spot
+PRE_BREAK_INNER      = 5.0    # pts — inner pressure zone boundary
+PRE_BREAK_OUTER      = 10.0   # pts — outer pressure zone boundary
+AIR_POCKET_MIN       = 20.0   # pts — gap to next HIGH zone triggering expansion bonus
 
 
 def parse_levels(raw_levels):
@@ -1334,22 +1340,23 @@ def filter_vwap_levels(parsed_levels, spot):
     return {n: parsed_levels[n] for n in keep if n in parsed_levels}
 
 
-def cluster_levels(key_levels, proximity=5.0, parsed=None):
+def cluster_levels(key_levels, spot, proximity=CLUSTER_WINDOW, parsed=None):
     """
-    Group levels within proximity pts into zones.
-    Uses parsed level data for priority and dynamic zone widths.
-    Returns list of zone dicts:
-      {name, low, high, mid, members, priority, role, zone_width}
+    Group levels within CLUSTER_WINDOW pts into clusters.
+    Only considers levels within PROXIMITY_FILTER of spot.
 
-    priority = highest priority among members (HIGH > MEDIUM > LOW)
-    role     = SUPPORT if spot > zone.mid, else RESISTANCE
+    Each cluster:
+      - cluster_price: weighted average (HIGH=3, MEDIUM=2, LOW=1)
+      - cluster_strength: sum of weights (higher = stronger)
+      - priority: highest priority among members
+      - role: SUPPORT if spot > cluster_price, else RESISTANCE
+      - zone_width: based on top priority
+      - low/high: actual price boundaries of members
     """
     if not key_levels:
         return []
 
-    priority_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-
-    # Build flat list of (name, price, priority)
+    # Build flat list, apply proximity filter
     items = []
     for name, val in key_levels.items():
         if name == "VWAP":
@@ -1364,42 +1371,56 @@ def cluster_levels(key_levels, proximity=5.0, parsed=None):
             priority = "MEDIUM"
         else:
             continue
+        # Proximity filter — ignore far levels
+        if abs(price - spot) > PROXIMITY_FILTER:
+            continue
         items.append((name, price, priority))
 
     items.sort(key=lambda x: x[1])
 
-    zones = []
+    clusters = []
     i = 0
     while i < len(items):
         name, price, priority = items[i]
-        cluster = [(name, price, priority)]
+        group = [(name, price, priority)]
         j = i + 1
-        while j < len(items) and items[j][1] - cluster[0][1] <= proximity:
-            cluster.append(items[j])
+        while j < len(items) and items[j][1] - group[0][1] <= proximity:
+            group.append(items[j])
             j += 1
-        prices     = [c[1] for c in cluster]
-        priorities = [c[2] for c in cluster]
-        top_priority = max(priorities, key=lambda p: priority_rank.get(p, 0))
+
+        prices     = [c[1] for c in group]
+        priorities = [c[2] for c in group]
+        weights    = [PRIORITY_WEIGHT.get(c[2], 1) for c in group]
+        top_priority = max(priorities, key=lambda p: PRIORITY_WEIGHT.get(p, 0))
+
+        # Weighted average price
+        total_weight   = sum(weights)
+        cluster_price  = round(sum(p * w for (_, p, _), w in zip(group, weights)) / total_weight, 2)
+        cluster_strength = total_weight  # higher = more levels/higher priority
+
         low  = min(prices)
         high = max(prices)
-        mid  = round((low + high) / 2, 2)
         zone_width = PRIORITY_ZONE_WIDTH.get(top_priority, 4)
-        label = f"Zone {low:.0f}–{high:.0f}" if len(cluster) > 1 else cluster[0][0]
-        zones.append({
-            "name":       label,
-            "low":        low,
-            "high":       high,
-            "mid":        mid,
-            "members":    [c[0] for c in cluster],
-            "priority":   top_priority,
-            "zone_width": zone_width,
+        label = f"Zone {low:.0f}–{high:.0f}" if len(group) > 1 else group[0][0]
+        role  = "SUPPORT" if spot > cluster_price else "RESISTANCE"
+
+        clusters.append({
+            "name":             label,
+            "low":              low,
+            "high":             high,
+            "mid":              cluster_price,   # weighted avg, not simple midpoint
+            "members":          [c[0] for c in group],
+            "priority":         top_priority,
+            "cluster_strength": cluster_strength,
+            "zone_width":       zone_width,
+            "role":             role,
         })
         i = j
-    return zones
+    return clusters
 
 
 def assign_zone_roles(zones, spot):
-    """Add role (SUPPORT/RESISTANCE) to each zone based on spot price."""
+    """Refresh role (SUPPORT/RESISTANCE) on each zone."""
     for zone in zones:
         zone["role"] = "SUPPORT" if spot > zone["mid"] else "RESISTANCE"
     return zones
@@ -1407,42 +1428,171 @@ def assign_zone_roles(zones, spot):
 
 def find_nearest_zone(spot, zones, min_priority="MEDIUM"):
     """
-    Return nearest zone within its own zone_width of spot.
-    Filters by minimum priority: HIGH only, or HIGH+MEDIUM, or all.
-    Ignores LOW zones unless min_priority="LOW".
+    Return nearest cluster within PRE_BREAK_OUTER pts of spot.
+    Only considers clusters at or above min_priority.
     """
-    priority_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-    min_rank      = priority_rank.get(min_priority, 2)
-    nearest       = None
-    nearest_dist  = float("inf")
+    min_rank = PRIORITY_WEIGHT.get(min_priority, 2)
+    nearest, nearest_dist = None, float("inf")
     for zone in zones:
-        if priority_rank.get(zone["priority"], 0) < min_rank:
+        if PRIORITY_WEIGHT.get(zone["priority"], 0) < min_rank:
             continue
         dist = min(abs(spot - zone["low"]), abs(spot - zone["high"]), abs(spot - zone["mid"]))
-        if dist <= zone["zone_width"] and dist < nearest_dist:
+        if dist <= PRE_BREAK_OUTER and dist < nearest_dist:
             nearest_dist = dist
-            nearest      = zone
+            nearest = zone
     return nearest
+
+
+def find_next_zone_in_direction(spot, zones, direction, min_priority="HIGH"):
+    """
+    Return the next HIGH zone in the given direction (BULL=above, BEAR=below).
+    Used for air pocket detection and alert context.
+    """
+    min_rank = PRIORITY_WEIGHT.get(min_priority, 3)
+    candidates = []
+    for zone in zones:
+        if PRIORITY_WEIGHT.get(zone["priority"], 0) < min_rank:
+            continue
+        if direction == "BULL" and zone["mid"] > spot:
+            candidates.append(zone)
+        elif direction == "BEAR" and zone["mid"] < spot:
+            candidates.append(zone)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda z: abs(z["mid"] - spot))
+
+
+def detect_pre_break_pressure(spot, bars, atr, zones, vwap, now_et):
+    """
+    Detect pre-breakout pressure conditions near a cluster.
+    Returns (pressure_zone, score_boost, description) or (None, 0, "").
+
+    Conditions (all required):
+      1. Nearest HIGH/MEDIUM cluster within PRE_BREAK_OUTER (10pts)
+      2. Directional alignment: spot < zone.mid → BULL pressure (mom3 > 0 required)
+                                spot > zone.mid → BEAR pressure (mom3 < 0 required)
+      3. Compression confirmed (calc_compression_score > 0) — energy must be coiling
+      4. Time >= 9:45 ET
+
+    Scoring:
+      Base: +1 outer zone (<=10pts), +2 inner zone (<=5pts)
+      +1 cluster_strength >= 6 (multiple confluent levels)
+      +2 air pocket >= AIR_POCKET_MIN pts to next HIGH zone
+    """
+    if now_et.time() < datetime.time(9, 45) or len(bars) < 6:
+        return None, 0, ""
+
+    # Fix 1: compression as boost, not gate
+    atr_val = atr or calc_atr(bars)
+    compression_score, _ = calc_compression_score(bars, atr_val, {}, now_et)
+
+    mom3    = calc_momentum(bars, 3)
+    nearest = find_nearest_zone(spot, zones, min_priority="MEDIUM")
+    if not nearest:
+        return None, 0, ""
+
+    dist_to_low  = spot - nearest["low"]
+    dist_to_high = nearest["high"] - spot
+
+    if spot < nearest["mid"]:
+        expected_direction = "BULL"
+        approaching = 0 < dist_to_high <= PRE_BREAK_OUTER
+    else:
+        expected_direction = "BEAR"
+        approaching = 0 < dist_to_low <= PRE_BREAK_OUTER
+
+    if not approaching:
+        return None, 0, ""
+
+    if expected_direction == "BULL" and mom3 <= 0:
+        return None, 0, ""
+    if expected_direction == "BEAR" and mom3 >= 0:
+        return None, 0, ""
+
+    dist = dist_to_high if expected_direction == "BULL" else dist_to_low
+
+    boost = 2 if dist <= PRE_BREAK_INNER else 1
+
+    # Compression bonus (not gate)
+    if compression_score > 0:
+        boost += 1
+
+    # Cluster strength bonus
+    if nearest.get("cluster_strength", 0) >= 6:
+        boost += 1
+
+    # Fix 3: air pocket — no next zone = open air
+    context_note = ""
+    next_zone = find_next_zone_in_direction(spot, zones, expected_direction, min_priority="HIGH")
+    if not next_zone:
+        boost += 2
+        context_note = " | Open air (no resistance/support beyond)"
+    elif abs(next_zone["mid"] - spot) >= AIR_POCKET_MIN:
+        gap = abs(next_zone["mid"] - spot)
+        boost += 2
+        context_note = f" | Air pocket → {gap:.0f}pts to {next_zone['name']}"
+
+    desc = (f"{'Pressing' if dist <= PRE_BREAK_INNER else 'Approaching'} "
+            f"{nearest['name']} from {'below' if expected_direction == 'BULL' else 'above'} "
+            f"({dist:.1f}pts) | mom3 {mom3:+.1f}{context_note}")
+
+    return nearest, boost, desc
+
+
+def detect_air_pocket(spot, zones, direction):
+    """
+    If price just cleared a HIGH zone and next HIGH zone is >AIR_POCKET_MIN away,
+    return (True, next_zone, gap_size). Otherwise (False, None, 0).
+    """
+    next_zone = find_next_zone_in_direction(spot, zones, direction, min_priority="HIGH")
+    if not next_zone:
+        return True, None, 999  # no resistance above/below = air pocket
+    gap = abs(next_zone["mid"] - spot)
+    if gap >= AIR_POCKET_MIN:
+        return True, next_zone, round(gap, 1)
+    return False, next_zone, round(gap, 1)
+
+
+def format_zone_context(spot, zones, vwap):
+    """
+    Build the 'Key Zone' context string for Telegram alerts.
+    Shows nearest cluster + above/below targets.
+    """
+    nearest = find_nearest_zone(spot, zones, min_priority="MEDIUM")
+    above   = find_next_zone_in_direction(spot, zones, "BULL", min_priority="MEDIUM")
+    below   = find_next_zone_in_direction(spot, zones, "BEAR", min_priority="MEDIUM")
+
+    lines = []
+    if nearest:
+        lines.append(f"*Key Zone:* {nearest['name']} [{nearest['priority']}] | {nearest['role']}")
+    if above:
+        air, _, gap = detect_air_pocket(spot, zones, "BULL")
+        suffix = " (open air)" if air and gap >= AIR_POCKET_MIN else ""
+        lines.append(f"*Above →* {above['name']} ({above['mid']:.0f}){suffix}")
+    if below:
+        lines.append(f"*Below →* {below['name']} ({below['mid']:.0f})")
+    if vwap:
+        vwap_role = "above" if spot > vwap else "below"
+        lines.append(f"*VWAP:* {vwap:,.2f} (price {vwap_role})")
+    return "\n".join(lines)
 
 
 def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or_low=None):
     """
-    Detects early structural setups and returns a setup object.
-    Does NOT trigger trades — sends awareness alert only.
+    Detects early structural setups. Returns setup dict or None.
 
     Types:
-      COMPRESSION_SETUP        — range contracting near HIGH/MEDIUM zone
+      PRE_BREAK_SETUP          — pressure building near cluster (earliest signal)
+      COMPRESSION_SETUP        — range contracting near HIGH/MEDIUM cluster
       VWAP_RECLAIM_SETUP       — price crossing and holding above/below VWAP
       TREND_CONTINUATION_SETUP — trend walking above VWAP with shallow pullbacks
 
     Level handling:
-      - Parses (price, priority) format from levels.py
-      - Filters VWAP levels to 2 above + 2 below spot
-      - Clusters remaining levels into zones with priority-based widths
-      - Only allows COMPRESSION_SETUP near HIGH or MEDIUM zones
-      - Zone role (SUPPORT/RESISTANCE) informs setup bias
-
-    Returns dict with type/bias/level/message/direction or None.
+      - Parses (price, priority) format
+      - Filters VWAPs to 2 above + 2 below
+      - Clusters within 15pts with weighted average price
+      - Proximity filter: only clusters within ±25pts of spot
+      - PRE_BREAK fires before full breakout confirmation
     """
     if not bars or not vwap:
         return None
@@ -1451,19 +1601,46 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
     atr    = calc_atr(bars)
     bias   = context["bias"]
     regime = context["regime"]
+    now_et = datetime.datetime.now(ET)
 
-    # Parse and filter levels
+    # Parse, filter, cluster
     parsed   = parse_levels(key_levels) if key_levels else {}
     filtered = filter_vwap_levels(parsed, spot)
+    flat     = {n: v["price"] for n, v in filtered.items()}
+    zones    = cluster_levels(flat, spot, proximity=CLUSTER_WINDOW, parsed=filtered)
+    zones    = assign_zone_roles(zones, spot)
+    ctx_str  = format_zone_context(spot, zones, vwap)
 
-    # Build flat price dict for backward compat with existing engines
-    flat_levels = {n: v["price"] for n, v in filtered.items()}
+    # ── PRE_BREAK_SETUP — earliest signal, fires before compression confirmed ─
+    if now_et.time() >= datetime.time(9, 45) and len(bars) >= 6:
+        pressure_zone, boost, pressure_desc = detect_pre_break_pressure(
+            spot, bars, atr, zones, vwap, now_et
+        )
+        if pressure_zone and boost > 0:
+            # Direction from zone position: spot below mid = BULL, spot above mid = BEAR
+            direction = "BULL" if spot < pressure_zone["mid"] else "BEAR"
+            air, next_z, gap = detect_air_pocket(spot, zones, direction)
+            air_str = f" → {next_z['name']} ({gap:.0f}pts, open air)" if air and next_z else ""
+            return {
+                "type":        "PRE_BREAK_SETUP",
+                "bias":        direction,
+                "level":       pressure_zone["name"],
+                "level_price": pressure_zone["mid"],
+                "level_low":   pressure_zone["low"],
+                "level_high":  pressure_zone["high"],
+                "zone_width":  pressure_zone["zone_width"],
+                "role":        pressure_zone["role"],
+                "priority":    pressure_zone["priority"],
+                "pre_break_boost": boost,
+                "message":     (f"Pressure building near {pressure_zone['name']} "
+                               f"[{pressure_zone['priority']}] — {pressure_desc}{air_str}"),
+                "zone_context": ctx_str,
+                "spot":        round(spot, 2),
+                "vwap":        vwap,
+                "atr":         atr,
+            }
 
-    # Cluster and assign roles
-    zones = cluster_levels(flat_levels, proximity=5.0, parsed=filtered)
-    zones = assign_zone_roles(zones, spot)
-
-    # ── COMPRESSION_SETUP — HIGH/MEDIUM zone + confirmed range contraction ───
+    # ── COMPRESSION_SETUP ────────────────────────────────────────────────────
     if regime == "COMPRESSION":
         near_zone = find_nearest_zone(spot, zones, min_priority="MEDIUM")
         if near_zone:
@@ -1472,13 +1649,13 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                 avg_recent = sum(b["h"] - b["l"] for b in bars[-5:]) / 5
                 avg_prior  = sum(b["h"] - b["l"] for b in bars[-20:-5]) / 15
                 compression_confirmed = avg_prior > 0 and avg_recent < avg_prior * COMPRESSION_RANGE_RATIO
-            # Spot within zone_width of boundary
             near_boundary = (abs(spot - near_zone["low"]) <= near_zone["zone_width"] or
                              abs(spot - near_zone["high"]) <= near_zone["zone_width"])
             if compression_confirmed and near_boundary:
-                # Bias from zone role: SUPPORT → BULL, RESISTANCE → BEAR
                 role_bias = "BULL" if near_zone["role"] == "SUPPORT" else "BEAR"
                 direction = role_bias if bias == "NEUTRAL" else bias
+                air, next_z, gap = detect_air_pocket(spot, zones, direction)
+                air_str = f" → {next_z['name']} open air" if air and next_z else ""
                 return {
                     "type":        "COMPRESSION_SETUP",
                     "bias":        direction,
@@ -1490,8 +1667,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                     "role":        near_zone["role"],
                     "priority":    near_zone["priority"],
                     "message":     (f"Compression near {near_zone['name']} "
-                                   f"[{near_zone['priority']}] — "
-                                   f"{near_zone['role']} zone — watch for expansion"),
+                                   f"[{near_zone['priority']}] — {near_zone['role']} zone{air_str}"),
+                    "zone_context": ctx_str,
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
@@ -1507,6 +1684,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
             now_above   = sum(1 for b in last3[1:] if b["c"] > vwap) >= 2
             net_reclaim = spot - last3[0]["c"]
             if was_below and now_above and spot > vwap and net_reclaim >= 2.0:
+                air, next_z, gap = detect_air_pocket(spot, zones, "BULL")
+                air_str = f" → {next_z['name']} ({gap:.0f}pts)" if next_z else ""
                 return {
                     "type":        "VWAP_RECLAIM_SETUP",
                     "bias":        "BULL",
@@ -1517,7 +1696,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                     "zone_width":  4,
                     "role":        "SUPPORT",
                     "priority":    "HIGH",
-                    "message":     f"VWAP reclaim — accepting above {vwap:,.2f} — potential long continuation",
+                    "message":     f"VWAP reclaim above {vwap:,.2f} — potential long{air_str}",
+                    "zone_context": ctx_str,
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
@@ -1526,6 +1706,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
             now_below     = sum(1 for b in last3[1:] if b["c"] < vwap) >= 2
             net_rejection = last3[0]["c"] - spot
             if was_above and now_below and spot < vwap and net_rejection >= 2.0:
+                air, next_z, gap = detect_air_pocket(spot, zones, "BEAR")
+                air_str = f" → {next_z['name']} ({gap:.0f}pts)" if next_z else ""
                 return {
                     "type":        "VWAP_RECLAIM_SETUP",
                     "bias":        "BEAR",
@@ -1536,7 +1718,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                     "zone_width":  4,
                     "role":        "RESISTANCE",
                     "priority":    "HIGH",
-                    "message":     f"VWAP rejection — accepting below {vwap:,.2f} — potential short continuation",
+                    "message":     f"VWAP rejection below {vwap:,.2f} — potential short{air_str}",
+                    "zone_context": ctx_str,
                     "spot":        round(spot, 2),
                     "vwap":        vwap,
                     "atr":         atr,
@@ -1571,6 +1754,8 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
         sufficient_move   = (bias == "BULL" and net15 >= 8.0) or (bias == "BEAR" and net15 <= -8.0)
         if slope_aligned and not_extended and sufficient_closes and sufficient_move:
             direction_word = "higher" if bias == "BULL" else "lower"
+            air, next_z, gap = detect_air_pocket(spot, zones, bias)
+            air_str = f" → {next_z['name']} ({gap:.0f}pts)" if next_z else ""
             return {
                 "type":        "TREND_CONTINUATION_SETUP",
                 "bias":        bias,
@@ -1581,8 +1766,9 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
                 "zone_width":  4,
                 "role":        "SUPPORT" if bias == "BULL" else "RESISTANCE",
                 "priority":    "HIGH",
-                "message":     (f"Trend continuation — grind {direction_word} | "
-                               f"{closes_aligned}/15 bars aligned | net {net15:+.1f}pts"),
+                "message":     (f"Trend {direction_word} | {closes_aligned}/15 aligned | "
+                               f"net {net15:+.1f}pts{air_str}"),
+                "zone_context": ctx_str,
                 "spot":        round(spot, 2),
                 "vwap":        vwap,
                 "atr":         atr,
@@ -1593,27 +1779,27 @@ def detect_setup(context, bars, vwap, vwap_history, key_levels, or_high=None, or
 
 def format_setup_message(setup, or_high=None, or_low=None):
     """Format SETUP awareness alert for Telegram."""
-    emoji = "\U0001f7e1"  # yellow circle = awareness, not trade
-    bias_str = setup["bias"]
+    emoji = "\U0001f7e1"  # yellow circle
+    bias_str  = setup["bias"]
     direction = "LONG" if bias_str == "BULL" else "SHORT" if bias_str == "BEAR" else "WATCH"
     t = datetime.datetime.now(ET).strftime("%I:%M %p ET")
-
-    # What to watch
-    level = setup.get("level", "")
-    level_price = setup.get("level_price")
-    watch_str = f"{level} ({level_price:,.2f})" if level_price else level
+    priority  = setup.get("priority", "")
+    role      = setup.get("role", "")
+    zone_ctx  = setup.get("zone_context", "")
 
     msg = (
         f"{emoji} *SETUP: {setup['type']}*\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"*Direction:* {direction}\n"
-        f"*Watch:*     {watch_str}\n"
+        f"*Direction:* {direction} | *Zone:* {setup.get('level', '')} [{priority}]\n"
+        f"*Role:*      {role}\n"
         f"*Time:*      {t}\n"
         f"*SPX:*       {setup['spot']:,.2f} | VWAP: {setup['vwap']:,.2f}\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"{setup['message']}\n"
-        f"_No trade yet — waiting for trigger confirmation_"
     )
+    if zone_ctx:
+        msg += f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{zone_ctx}\n"
+    msg += f"_No trade yet — waiting for trigger confirmation_"
     return msg
 
 
@@ -1783,6 +1969,10 @@ def format_trigger_message(trigger, setup, closed_bars, vwap, vix, session, atr)
         f"*No chase:* past {exits['no_chase']:,.2f}\n"
         f"*Exit by:* 3:45 PM ET"
     )
+    # Add zone context from setup if available
+    zone_ctx = setup.get("zone_context", "") if setup else ""
+    if zone_ctx:
+        msg += f"\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n{zone_ctx}"
     return msg
 
 # ─────────────────────────────────────────
